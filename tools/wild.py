@@ -246,9 +246,14 @@ def resolve_dash(text, base, want_media=False):
                 def _sub(match):
                     var, fmt = match.group(1), match.group(2)
                     val = start if var == "Number" else first_t
-                    return ("%" + fmt) % int(val) if fmt else val
+                    # Keep the zero-pad flag: $Number%04d$ must render "0001",
+                    # not "   1". A bare $Number%4d$ is legal printf but means
+                    # space padding, never wanted in a URL, so normalise it.
+                    if not fmt:
+                        return val
+                    return ("%" + (fmt if fmt.startswith("0") else "0" + fmt)) % int(val)
 
-                url = re.sub(r"\$(Number|Time)(?:%0?(\d+d))?\$", _sub, url)
+                url = re.sub(r"\$(Number|Time)(?:%(0?\d+d))?\$", _sub, url)
                 if "$" in url:
                     continue
             # An init segment carries the moov, so its classification is
