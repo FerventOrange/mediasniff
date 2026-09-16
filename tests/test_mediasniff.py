@@ -438,6 +438,14 @@ def test_declared_audio_that_never_arrives():
     assert "not seen in this prefix" in prefix.verdict
 
 
+def test_user_agent_tracks_the_declared_version():
+    """The UA is what stream origins see in their logs, and it had drifted to
+    "mediasniff/1.0" while the project was being tagged 0.1.0. Deriving it from
+    __version__ means the two cannot disagree again."""
+    assert ms.__version__ == "0.1.0"
+    assert ms._UA.startswith(f"mediasniff/{ms.__version__} ")
+
+
 def test_non_media_bodies_are_named_not_shrugged_at():
     """Dead stream URLs answer with something, and naming it is more useful than
     "unknown". One origin in the wild sample literally returns a shrug."""
