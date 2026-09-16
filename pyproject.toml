@@ -5,8 +5,47 @@ pythonpath = ["src"]
 init-hook = "import sys; sys.path.insert(0, 'src')"
 
 [tool.pylint."messages control"]
-disable = ["too-many-branches", "too-many-statements", "too-many-locals",
-           "too-many-return-statements", "too-many-nested-blocks"]
+# Each of these is a deliberate property of this codebase, not an oversight.
+# Anything not listed here is enforced.
+disable = [
+    # Format parsers are inherently branchy: one arm per box type, per stream
+    # type, per codec. Splitting them to satisfy a counter would scatter a
+    # table that reads better whole.
+    "too-many-branches",
+    "too-many-statements",
+    "too-many-locals",
+    "too-many-return-statements",
+    "too-many-nested-blocks",
+    "too-many-instance-attributes",   # Report/Track/TrafInfo are record types
+    "too-many-arguments",             # probe_url's options are all optional
+    # src/mediasniff.py is one module on purpose: it is a single-file drop-in
+    # with no dependencies, which is most of its value.
+    "too-many-lines",
+    # sniff() does no I/O, and keeping it that way means urllib, ssl and
+    # xml.etree are imported inside the URL layer rather than at module scope.
+    # The CLI's argparse import is local for the same reason.
+    "import-outside-toplevel",
+    # The network layer must survive anything an arbitrary origin does.
+    "broad-exception-caught",
+    # Bit manipulation reads better with explicit grouping: `not (b & 0x06)`
+    # says what it means more clearly than relying on operator precedence.
+    "superfluous-parens",
+    # Known and tracked: tools/wild.py carries its own copy of the manifest
+    # resolution logic that src/mediasniff.py now also has. Consolidating them
+    # behind probe_url() is the outstanding cleanup, not something to hide.
+    "duplicate-code",
+]
+
+[tool.black]
+# 100 rather than black's default 88, to match the line length this code was
+# written at and keep the reformatting diff to genuine style fixes.
+line-length = 100
+
+[tool.isort]
+profile = "black"
+line_length = 100
+src_paths = ["src", "tests", "tools"]
+known_first_party = ["mediasniff"]
 
 [tool.ruff]
 line-length = 100
