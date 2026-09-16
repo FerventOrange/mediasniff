@@ -563,3 +563,89 @@ def test_normalized_kind_matches_manifest_vocabulary():
     assert ms._normalized_kind(ms.sniff(_load("init_video.dash"))) == "video"
     assert ms._normalized_kind(ms.sniff(_load("init_audio.dash"))) == "audio"
     assert ms._normalized_kind(ms.sniff(_load("apple_vtt_seg.mp4"))) == "subtitles"
+
+
+# --- the all-intra / absence-of-evidence defect -----------------------------
+#
+# No real sample of this exists in the corpus, and that is the point: the wild
+# sweeps were structurally blind to it. Clear all-intra video is rescued by the
+# mdat NAL check; encrypted all-intra has no rescue, and DRM-protected
+# trickplay tracks -- the common real instance -- cannot be sampled from public
+# stream directories. So it is pinned synthetically.
+
+def _fragment(duration, sizes, payload):
+    """Minimal styp+moof+mdat with a chosen sample table and opaque payload."""
+    def box(btype, body):
+        return struct.pack(">I", len(body) + 8) + btype + body
+
+    tfhd = box(b"tfhd", struct.pack(">I", 0x020000 | 0x08)
+               + struct.pack(">I", 1) + struct.pack(">I", duration))
+    trun_body = struct.pack(">I", 0x000201) + struct.pack(">I", len(sizes)) + struct.pack(">i", 0)
+    for size in sizes:
+        trun_body += struct.pack(">I", size)
+    traf = box(b"traf", tfhd + box(b"tfdt", struct.pack(">II", 0, 0))
+               + box(b"trun", trun_body))
+    return (box(b"styp", b"msdh" + b"\x00" * 4 + b"msdh")
+            + box(b"moof", box(b"mfhd", struct.pack(">II", 0, 1)) + traf)
+            + box(b"mdat", payload))
+
+
+# All-intra CBR: every sample is a keyframe, so there is no size peak, no
+# B-frames and no non-sync flags -- and rate control holds the frames flat.
+_ALL_INTRA_CBR = [8000 + ((i * 37) % 400) for i in range(30)]
+
+
+def test_all_intra_video_is_not_concluded_to_be_audio():
+    """The defect this gate exists for.
+
+    Absence of video tells is not evidence of audio. All-intra CBR video has a
+    sample table indistinguishable from audio, and when its payload is
+    encrypted there is no syncword to break the tie. Scoring it as audio
+    produced a *confident* wrong answer with no fallback.
+    """
+    blob = _fragment(3600, _ALL_INTRA_CBR, os.urandom(sum(_ALL_INTRA_CBR)))
+    kind, _codec, _why, score = ms._classify_traf(ms._scan_trafs(blob)[0])
+    assert kind is ms.Kind.UNKNOWN, f"claimed {kind.value} at score {score:+.1f}"
+    assert -2.0 < score < 2.0
+
+    rep = ms.sniff(blob)
+    assert not rep.verdict.startswith("audio-only")
+    # And it must not overcorrect into guessing video either: with an
+    # unreadable payload and no usable tells, undetermined is the true answer.
+    assert not rep.verdict.startswith("video-only")
+    assert "undetermined" in rep.verdict
+    assert rep.confidence == "low"
+
+
+def test_undetermined_is_not_reported_as_no_media():
+    """"A track we cannot type" and "no media here" are different claims."""
+    blob = _fragment(3600, _ALL_INTRA_CBR, os.urandom(sum(_ALL_INTRA_CBR)))
+    rep = ms.sniff(blob)
+    assert rep.tracks, "the track exists even though its kind does not resolve"
+    assert "no identifiable media tracks" not in rep.verdict
+
+
+def test_the_gate_does_not_cost_us_real_audio():
+    """Gating on positive audio timing must not weaken genuine audio."""
+    for duration, sizes in ((1024, [418] * 200),      # AAC-LC CBR
+                            (1536, [1792] * 120),     # AC-3
+                            (2048, [300] * 100)):     # HE-AAC
+        blob = _fragment(duration, sizes, os.urandom(sum(sizes)))
+        assert ms.sniff(blob).verdict.startswith("audio-only"), duration
+
+
+def test_known_limitation_audio_frame_duration_collision():
+    """Documents what this fix does NOT solve, so nobody assumes it is sound.
+
+    A sample duration is timescale/fps, and the timescale lives in the init
+    segment's mdhd. From a moof alone, duration 512 is either an Opus/AAC-LD
+    frame or 25 fps at timescale 12800 -- genuinely ambiguous. All-intra CBR
+    video at such a duration still resolves to audio, wrongly. It is asserted
+    here rather than left undiscovered; the fix is to fetch the init segment.
+    """
+    colliding = sorted(ms.AUDIO_FRAME_DURATIONS & {512, 1024, 480, 960})
+    assert colliding, "these are the values reachable by video at 24/25/30 fps"
+    blob = _fragment(512, _ALL_INTRA_CBR, os.urandom(sum(_ALL_INTRA_CBR)))
+    rep = ms.sniff(blob)
+    assert rep.verdict.startswith("audio-only")        # known-wrong, by design
+    assert rep.confidence != "high", "at least never claim high confidence here"
