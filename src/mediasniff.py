@@ -1806,13 +1806,421 @@ def format_report(name: str, rep: Report) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------
+# Resolving a stream URL down to fragments
+# --------------------------------------------------------------------------
+#
+# sniff() above is pure: bytes in, Report out, no I/O, no imports beyond the
+# stdlib basics. This section is a thin layer on top for the form the question
+# usually arrives in -- you have a stream URL, not a fragment on disk, and what
+# you want to know is which of its renditions carry what.
+#
+# It walks a master playlist or MPD down to one fragment per rendition and
+# classifies each, then shows what the manifest *claimed* beside what the bytes
+# actually carry. Those two disagree often enough in the wild that showing both
+# is the point rather than a debugging aid.
+
+_UA = "mediasniff/1.0 (+https://github.com/FerventOrange/mediasniff)"
+
+_HLS_MEDIA_KINDS = {"AUDIO": "audio", "SUBTITLES": "subtitles",
+                    "CLOSED-CAPTIONS": "closed captions"}
+
+# Used only to turn a CODECS attribute into a comparable claim. Deliberately
+# not exhaustive -- it needs to answer "video, audio, or both", nothing finer.
+_CODECS_VIDEO = ("avc1", "avc2", "avc3", "avc4", "hvc1", "hev1", "dvh1", "dvhe",
+                 "vp08", "vp09", "vp8", "vp9", "av01", "mp4v", "vvc1", "vvi1")
+_CODECS_AUDIO = ("mp4a", "ac-3", "ec-3", "ac-4", "opus", "flac", "alac", "dts",
+                 "mp3", "mha1", "mhm1")
+
+
+def _claim_from_codecs(codecs: str) -> str:
+    """What a CODECS attribute claims the fragment carries."""
+    low = codecs.lower()
+    has_v = any(c in low for c in _CODECS_VIDEO)
+    has_a = any(c in low for c in _CODECS_AUDIO)
+    if has_v and has_a:
+        return "muxed"
+    if has_v:
+        return "video"
+    if has_a:
+        return "audio"
+    return codecs or "?"
+
+
+@dataclass
+class Rendition:
+    """One selectable stream within a manifest."""
+    label: str
+    url: str
+    declared: str = ""          # what the manifest says it carries
+    note: str = ""
+
+    def __str__(self) -> str:
+        return self.label
+
+
+def _http_get(url: str, nbytes: int | None = None, timeout: float = 15.0,
+              insecure: bool = False) -> tuple[bytes, str]:
+    """GET a URL, optionally only its first `nbytes`. Returns (body, final_url).
+
+    Handles the two things that otherwise produce mystery failures: origins that
+    gzip a playlist without the client decoding it, and origins with broken TLS.
+    """
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": _UA, "Accept": "*/*"})
+    if nbytes:
+        req.add_header("Range", f"bytes=0-{nbytes - 1}")
+    ctx = None
+    if insecure:
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as fh:
+        body = fh.read(nbytes or (8 << 20))
+        if fh.headers.get("Content-Encoding", "").lower() == "gzip":
+            try:
+                body = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(body)
+            except zlib.error:
+                pass
+        return body, fh.geturl()
+
+
+def _attr(line: str, name: str) -> str:
+    import re as _re
+    hit = _re.search(name + r'="([^"]*)"', line) or _re.search(name + r"=([^,\s]+)", line)
+    return hit.group(1) if hit else ""
+
+
+def hls_master_renditions(text: str, base: str) -> list[Rendition]:
+    """Every selectable rendition in an HLS master playlist.
+
+    An EXT-X-MEDIA entry *without* a URI is skipped deliberately: per RFC 8216
+    that rendition is already present inside the variant streams, so it has no
+    fragments of its own to fetch.
+    """
+    import urllib.parse
+
+    out: list[Rendition] = []
+    lines = text.splitlines()
+    external_audio_groups = {
+        _attr(ln, "GROUP-ID") for ln in lines
+        if ln.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in ln and _attr(ln, "URI")
+    }
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if line.startswith("#EXT-X-MEDIA:"):
+            uri = _attr(line, "URI")
+            kind = _HLS_MEDIA_KINDS.get(_attr(line, "TYPE"), "")
+            if not uri or not kind:
+                continue
+            name = _attr(line, "NAME") or _attr(line, "LANGUAGE") or "?"
+            lang = _attr(line, "LANGUAGE")
+            label = f"{kind}: {name}" + (f" ({lang})" if lang and lang != name else "")
+            channels = _attr(line, "CHANNELS")
+            out.append(Rendition(label, urllib.parse.urljoin(base, uri), kind,
+                                 f"{channels}ch" if channels else ""))
+        elif line.startswith("#EXT-X-I-FRAME-STREAM-INF"):
+            uri = _attr(line, "URI")
+            if uri:
+                res = _attr(line, "RESOLUTION")
+                out.append(Rendition(f"trickplay {res}".strip(),
+                                     urllib.parse.urljoin(base, uri),
+                                     "video", "I-frame only"))
+        elif line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if not nxt or nxt.startswith("#"):
+                continue
+            res = _attr(line, "RESOLUTION")
+            codecs = _attr(line, "CODECS")
+            claim = _claim_from_codecs(codecs)
+            # An EXT-X-MEDIA group without a URI means that rendition already
+            # lives inside this variant, so AUDIO= alone does not move it out.
+            if claim == "muxed" and _attr(line, "AUDIO") in external_audio_groups:
+                claim = "video"
+            out.append(Rendition(f"variant {res or 'audio-only'}",
+                                 urllib.parse.urljoin(base, nxt), claim, codecs))
+    return out
+
+
+def hls_media_target(text: str, base: str, prefer_media: bool = False) -> tuple[str, str]:
+    """Pick one fragment to fetch from an HLS media playlist.
+
+    The EXT-X-MAP init segment is preferred when present: it carries the moov,
+    so the track kinds are read from a field rather than inferred. Pass
+    prefer_media=True to target a media fragment instead, which exercises the
+    harder init-less path.
+    """
+    import urllib.parse
+
+    init = ""
+    segments: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-MAP:"):
+            uri = _attr(line, "URI")
+            if uri:
+                init = urllib.parse.urljoin(base, uri)
+        elif line and not line.startswith("#"):
+            segments.append(urllib.parse.urljoin(base, line))
+    if init and not prefer_media:
+        return init, "init segment"
+    if segments:
+        # The last listed segment is the freshest on a live playlist; the first
+        # is the one most likely to roll off mid-fetch.
+        return segments[-1], "media segment"
+    return (init, "init segment") if init else ("", "")
+
+
+def mpd_renditions(text: str, base: str, prefer_media: bool = False) -> list[Rendition]:
+    """Every AdaptationSet in an MPD, resolved to one fragment each.
+
+    DASH states contentType/mimeType outright, so the manifest's own claim is
+    unambiguous here in a way HLS CODECS never is.
+    """
+    import re as _re
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+
+    ns = "{urn:mpeg:dash:schema:mpd:2011}"
+    root = ET.fromstring(text)
+    base_el = root.find(ns + "BaseURL")
+    if base_el is not None and base_el.text:
+        base = urllib.parse.urljoin(base, base_el.text.strip())
+
+    out: list[Rendition] = []
+    for period in root.iter(ns + "Period"):
+        for aset in period.iter(ns + "AdaptationSet"):
+            reps = aset.findall(ns + "Representation")
+            if not reps:
+                continue
+            rep = reps[0]
+            mime = aset.get("mimeType") or rep.get("mimeType") or ""
+            ctype = aset.get("contentType") or mime.split("/")[0]
+            codecs = aset.get("codecs") or rep.get("codecs") or ""
+            lang = aset.get("lang") or ""
+            # An ElementTree Element with no children is falsy, so `a or b`
+            # silently discards a valid childless SegmentTemplate. Always
+            # compare against None.
+            tmpl = aset.find(ns + "SegmentTemplate")
+            if tmpl is None:
+                tmpl = rep.find(ns + "SegmentTemplate")
+            if tmpl is None:
+                continue
+            tpl = tmpl.get("media") if prefer_media else tmpl.get("initialization")
+            if not tpl:
+                tpl = tmpl.get("initialization") or tmpl.get("media")
+            if not tpl:
+                continue
+            url = tpl.replace("$RepresentationID$", rep.get("id") or "")
+            url = url.replace("$Bandwidth$", rep.get("bandwidth") or "")
+            # Always attempt substitution rather than pattern-matching for
+            # specific spellings first: $Number%4d$ contains neither "$Number$"
+            # nor "%0", and a narrower guard silently dropped the rendition.
+            if "$" in url:
+                start = tmpl.get("startNumber") or "1"
+                first_t = "0"
+                timeline = tmpl.find(ns + "SegmentTimeline")
+                if timeline is not None:
+                    seg = timeline.find(ns + "S")
+                    if seg is not None:
+                        first_t = seg.get("t") or "0"
+
+                def _sub(match):
+                    var, fmt = match.group(1), match.group(2)
+                    val = start if var == "Number" else first_t
+                    # Keep the zero-pad flag: $Number%04d$ must render "0001",
+                    # not "   1". A bare $Number%4d$ is legal printf but means
+                    # space padding, which is never what a URL wants, so it is
+                    # normalised to zero padding too.
+                    if not fmt:
+                        return val
+                    return ("%" + (fmt if fmt.startswith("0") else "0" + fmt)) % int(val)
+
+                url = _re.sub(r"\$(Number|Time)(?:%(0?\d+d))?\$", _sub, url)
+            if "$" in url:
+                continue
+            label = f"{ctype or 'stream'}" + (f" ({lang})" if lang else "")
+            claim = {"video": "video", "audio": "audio",
+                     "text": "subtitles"}.get(ctype, "")
+            if not claim:
+                # DASH carries subtitle tracks as application/mp4; the codec is
+                # what distinguishes them from any other application payload.
+                low = codecs.lower()
+                if any(c in low for c in ("wvtt", "stpp", "ttml", "tx3g")):
+                    claim = "subtitles"
+                else:
+                    claim = _claim_from_codecs(codecs) if codecs else (ctype or "?")
+            out.append(Rendition(label, urllib.parse.urljoin(base, url), claim, codecs))
+    return out
+
+
+def probe_url(url: str, *, nbytes: int = 65536, timeout: float = 15.0,
+              prefer_media: bool = False, insecure: bool = False,
+              limit: int | None = None) -> list[tuple[Rendition, Report | None, str]]:
+    """Classify every rendition reachable from a stream URL.
+
+    Returns a list of (rendition, report, error). `report` is None when that
+    rendition could not be fetched, in which case `error` says why. A URL that
+    is already a fragment comes back as a single entry.
+    """
+    # Manifests are fetched whole. Applying the per-fragment byte limit to them
+    # truncates a playlist mid-URL, which yields a malformed segment URL and an
+    # HTTP 400 that looks like a dead stream rather than our own doing.
+    body, final = _http_get(url, None, timeout, insecure)
+    top = sniff(body)
+
+    if not top.is_playlist:
+        return [(Rendition("(direct fragment)", final, ""), top, "")]
+
+    text = body.decode("utf-8", "replace")
+    if top.container == "dash-mpd":
+        rends = mpd_renditions(text, final, prefer_media)
+    else:
+        rends = hls_master_renditions(text, final)
+        if not rends:
+            # A media playlist handed to us directly rather than a master.
+            target, note = hls_media_target(text, final, prefer_media)
+            rends = [Rendition("(media playlist)", target, "", note)] if target else []
+
+    if limit:
+        rends = rends[:limit]
+
+    results: list[tuple[Rendition, Report | None, str]] = []
+    for rend in rends:
+        try:
+            # Same again: the rendition URL may itself be a media playlist, so
+            # fetch it whole and only cap the fragment it points at.
+            blob, where = _http_get(rend.url, None, timeout, insecure)
+            child = sniff(blob)
+            if child.is_playlist:
+                target, note = hls_media_target(
+                    blob.decode("utf-8", "replace"), where, prefer_media)
+                if not target:
+                    results.append((rend, None, "playlist with no fetchable fragment"))
+                    continue
+                rend.note = rend.note or note
+                blob, where = _http_get(target, nbytes, timeout, insecure)
+                child = sniff(blob)
+            rend.url = where
+            results.append((rend, child, ""))
+        except Exception as exc:                            # noqa: BLE001
+            results.append((rend, None, f"{type(exc).__name__}: {exc}"))
+    return results
+
+
+def _short_verdict(rep: Report) -> str:
+    return rep.verdict.split("<-")[0].strip()
+
+
+def _normalized_kind(rep: Report) -> str:
+    """Reduce a verdict to the manifest's own vocabulary, for comparison."""
+    v = _short_verdict(rep).split("[")[0].strip()
+    for prefix, label in (("muxed", "muxed"), ("video-only", "video"),
+                          ("audio-only", "audio"), ("subtitles", "subtitles")):
+        if v.startswith(prefix):
+            return label
+    return ""
+
+
+def format_probe(url: str, results: list[tuple[Rendition, Report | None, str]]) -> str:
+    """Render probe_url output as a table, manifest claim beside measured reality."""
+    lines = [url, f"  {len(results)} rendition(s)", ""]
+    wl = max([len(r.label) for r, _, _ in results] + [9])
+    wd = max([len(r.declared) for r, _, _ in results] + [8])
+    lines.append(f"  {'rendition'.ljust(wl)}  {'declared'.ljust(wd)}  carries")
+    lines.append(f"  {'-' * wl}  {'-' * wd}  {'-' * 34}")
+    mismatches = []
+    for rend, rep, err in results:
+        if rep is None:
+            carries = f"[unreachable: {err}]"
+        else:
+            carries = _short_verdict(rep)
+            if rep.confidence != "high":
+                carries += f"  ({rep.confidence} confidence)"
+            claimed = rend.declared
+            got = _normalized_kind(rep)
+            if claimed in ("video", "audio", "muxed", "subtitles") and got and claimed != got:
+                carries += "   <-- manifest said " + claimed
+                mismatches.append((rend, "manifest",
+                                   f"claims {claimed}, bytes carry {got}"))
+            if "<-" in rep.verdict:
+                mismatches.append((rend, "container",
+                                   rep.verdict.split("<-", 1)[1].strip()))
+        lines.append(f"  {rend.label.ljust(wl)}  {rend.declared.ljust(wd)}  {carries}")
+    if mismatches:
+        lines.append("")
+        lines.append("  disagreements:")
+        for rend, source, detail in mismatches:
+            where = "manifest vs bytes" if source == "manifest" else "container index vs bytes"
+            lines.append(f"    {rend.label} [{where}]: {detail}")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
+    import argparse
     import sys
 
-    if len(sys.argv) < 2:
-        sys.exit(f"usage: {sys.argv[0]} <fragment> [fragment ...]")
-    for path in sys.argv[1:]:
-        with open(path, "rb") as fh:
-            blob = fh.read(4 << 20)
-        print(format_report(path, sniff(blob)))
+    ap = argparse.ArgumentParser(
+        prog="mediasniff",
+        description="Classify media fragments by their content, not their filename.",
+        epilog="Give it local fragments, or a stream URL (HLS master, DASH MPD, "
+               "media playlist, or a fragment) to have every rendition resolved "
+               "and classified.")
+    ap.add_argument("target", nargs="+", help="file path or http(s) URL")
+    ap.add_argument("-n", "--bytes", type=int, default=65536, metavar="N",
+                    help="bytes to read per fragment (default 65536; 4096 is "
+                         "enough for every format here)")
+    ap.add_argument("--media", action="store_true",
+                    help="target media fragments rather than init segments, "
+                         "exercising the harder init-less path")
+    ap.add_argument("--timeout", type=float, default=15.0, metavar="S")
+    ap.add_argument("--limit", type=int, default=None, metavar="N",
+                    help="classify at most N renditions per URL")
+    ap.add_argument("--insecure", action="store_true",
+                    help="skip TLS verification (many stream origins have "
+                         "broken certificates)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="full per-track detail and evidence for each rendition")
+    args = ap.parse_args()
+
+    failed = False
+    for target in args.target:
+        if target.startswith(("http://", "https://")):
+            try:
+                results = probe_url(target, nbytes=args.bytes, timeout=args.timeout,
+                                    prefer_media=args.media, insecure=args.insecure,
+                                    limit=args.limit)
+            except Exception as exc:                        # noqa: BLE001
+                print(f"{target}\n  could not fetch: {type(exc).__name__}: {exc}\n")
+                failed = True
+                continue
+            if not results:
+                print(f"{target}\n  no renditions found\n")
+                failed = True
+                continue
+            if args.verbose:
+                print(target)
+                for rend, rep, err in results:
+                    print()
+                    if rep is None:
+                        print(f"  {rend.label}: unreachable -- {err}")
+                    else:
+                        print(format_report(f"  {rend.label}  [{rend.url}]", rep))
+            else:
+                print(format_probe(target, results))
+            print()
+            continue
+
+        try:
+            with open(target, "rb") as fh:
+                blob = fh.read(max(args.bytes, 4 << 20))
+        except OSError as exc:
+            print(f"{target}\n  {exc.strerror}\n")
+            failed = True
+            continue
+        print(format_report(target, sniff(blob)))
         print()
+
+    sys.exit(1 if failed else 0)

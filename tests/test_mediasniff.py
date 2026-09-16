@@ -461,3 +461,105 @@ def test_truncated_input_does_not_raise():
 def test_garbage_input_does_not_raise():
     for blob in (b"", b"\x00" * 1024, b"\x47" * 1024, os.urandom(4096), b"ID3" + b"\xff" * 99):
         ms.sniff(blob)
+
+
+# --- URL resolution layer --------------------------------------------------
+#
+# All offline: these exercise the manifest parsers with static text, so the
+# suite never needs network. probe_url()'s own fetching is covered by
+# tools/wild.py against real streams.
+
+HLS_MASTER = """#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="English",LANGUAGE="en",CHANNELS="2",URI="a/eng.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="embedded",NAME="Built in",LANGUAGE="en"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="French",LANGUAGE="fr",URI="s/fr.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2",AUDIO="aac"
+v/720.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",AUDIO="embedded"
+v/1080.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=90000,RESOLUTION=640x360,URI="v/iframe.m3u8"
+"""
+
+MPD = """<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <Representation id="v1" bandwidth="800000" codecs="avc1.64001f"/>
+      <SegmentTemplate initialization="$RepresentationID$/init.mp4"
+                       media="$RepresentationID$/$Number%04d$.m4s" startNumber="1"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" lang="en" mimeType="audio/mp4">
+      <Representation id="a1" bandwidth="128000" codecs="mp4a.40.2"/>
+      <SegmentTemplate initialization="$RepresentationID$/init.mp4"
+                       media="$RepresentationID$/$Number%4d$.m4s" startNumber="7"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="application" lang="fr" mimeType="application/mp4">
+      <Representation id="t1" codecs="wvtt"/>
+      <SegmentTemplate initialization="$RepresentationID$/init.mp4"
+                       media="$RepresentationID$/$Number$.m4s"/>
+    </AdaptationSet>
+  </Period>
+</MPD>
+"""
+
+
+def test_hls_master_renditions():
+    rends = ms.hls_master_renditions(HLS_MASTER, "https://x.test/master.m3u8")
+    by_label = {r.label: r for r in rends}
+
+    # An EXT-X-MEDIA without a URI is already inside the variants and has no
+    # fragments of its own, so it must not appear as a fetchable rendition.
+    assert "audio: Built in (en)" not in by_label
+    assert by_label["audio: English (en)"].url == "https://x.test/a/eng.m3u8"
+    assert by_label["audio: English (en)"].declared == "audio"
+    assert by_label["subtitles: French (fr)"].declared == "subtitles"
+    assert by_label["trickplay 640x360"].declared == "video"
+
+    # CODECS lists both, but this variant's audio group HAS a URI, so its own
+    # segments are video-only...
+    assert by_label["variant 1280x720"].declared == "video"
+    # ...whereas this one's group has no URI, so the audio really is inside it.
+    assert by_label["variant 1920x1080"].declared == "muxed"
+
+
+def test_hls_media_target_prefers_the_init_segment():
+    playlist = ('#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n'
+                '#EXTINF:4,\nseg1.m4s\n#EXTINF:4,\nseg2.m4s\n')
+    url, note = ms.hls_media_target(playlist, "https://x.test/v/p.m3u8")
+    assert url == "https://x.test/v/init.mp4" and note == "init segment"
+    url, note = ms.hls_media_target(playlist, "https://x.test/v/p.m3u8", prefer_media=True)
+    assert url == "https://x.test/v/seg2.m4s" and note == "media segment"
+    # a TS playlist has no EXT-X-MAP at all
+    ts = "#EXTM3U\n#EXTINF:4,\na.ts\n#EXTINF:4,\nb.ts\n"
+    assert ms.hls_media_target(ts, "https://x.test/p.m3u8")[0] == "https://x.test/b.ts"
+
+
+def test_mpd_renditions_and_segment_template_formatting():
+    rends = ms.mpd_renditions(MPD, "https://x.test/m.mpd")
+    assert [r.declared for r in rends] == ["video", "audio", "subtitles"]
+    assert rends[0].url == "https://x.test/v1/init.mp4"
+
+    media = ms.mpd_renditions(MPD, "https://x.test/m.mpd", prefer_media=True)
+    # $Number%04d$ with startNumber=1
+    assert media[0].url == "https://x.test/v1/0001.m4s"
+    # $Number%4d$ is legal printf but means space padding; a URL never wants
+    # that, so it is normalised to zero padding. startNumber=7 here.
+    assert media[1].url == "https://x.test/a1/0007.m4s"
+    assert " " not in media[1].url
+    # bare $Number$ with no startNumber defaults to 1
+    assert media[2].url == "https://x.test/t1/1.m4s"
+
+
+def test_claim_from_codecs():
+    assert ms._claim_from_codecs("avc1.64001f,mp4a.40.2") == "muxed"
+    assert ms._claim_from_codecs("avc1.640028") == "video"
+    assert ms._claim_from_codecs("mp4a.40.5") == "audio"
+    assert ms._claim_from_codecs("ec-3") == "audio"
+    assert ms._claim_from_codecs("hvc1.2.4.L120.90") == "video"
+
+
+def test_normalized_kind_matches_manifest_vocabulary():
+    assert ms._normalized_kind(ms.sniff(_load("ts_muxed.ts"))) == "muxed"
+    assert ms._normalized_kind(ms.sniff(_load("init_video.dash"))) == "video"
+    assert ms._normalized_kind(ms.sniff(_load("init_audio.dash"))) == "audio"
+    assert ms._normalized_kind(ms.sniff(_load("apple_vtt_seg.mp4"))) == "subtitles"

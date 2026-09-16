@@ -23,6 +23,50 @@ brands. Correctly separated.
 
 ## Usage
 
+Point it at a stream URL and it resolves every rendition, then shows what the
+manifest *claims* beside what the bytes actually carry:
+
+```
+$ python3 src/mediasniff.py https://example.com/master.m3u8
+
+  rendition                     declared   carries
+  ----------------------------  ---------  ----------------------------------
+  variant 1280x720              video      video-only [init segment]
+  audio: English (en)           audio      audio-only [init segment]
+  subtitles: French (fr)        subtitles  subtitles/text-only
+  trickplay 640x360             video      video-only [init segment]
+```
+
+It accepts an HLS master playlist, a DASH MPD, a media playlist, a bare
+fragment, or a continuous Icecast stream. Local files work the same way.
+
+```
+-n, --bytes N   bytes to read per fragment (default 65536; 4096 suffices)
+--media         target media fragments rather than init segments, exercising
+                the harder init-less path
+--limit N       classify at most N renditions
+--insecure      skip TLS verification (many stream origins have broken certs)
+-v, --verbose   full per-track detail and evidence for each rendition
+```
+
+When the manifest and the bytes disagree, it says so and distinguishes the two
+kinds of disagreement -- the manifest against the fragment, and the fragment's
+own container index against its payload:
+
+```
+  variant 1920x1080   video   muxed (audio+video)   <-- manifest said video
+
+  disagreements:
+    variant 1920x1080 [manifest vs bytes]: claims video, bytes carry muxed
+```
+
+That is not a contrived example. It happens constantly -- see
+[The manifests lie](#the-manifests-lie).
+
+### As a library
+
+`sniff()` is pure: bytes in, report out, no I/O.
+
 ```python
 import mediasniff
 
@@ -31,10 +75,13 @@ report.verdict      # "muxed (audio+video)" | "video-only" | "audio-only" | ...
 report.container    # "mpeg-ts" | "isobmff" | "adts" | "webm/matroska" | ...
 report.tracks       # per-track kind, codec, PID/track_id, declared vs observed
 report.confidence   # "high" | "medium" | "low"
+report.drm          # scheme, DRM systems, key ids
 report.evidence     # why it concluded that, in order
 ```
 
-CLI: `python3 src/mediasniff.py <fragment> [fragment ...]`
+The URL layer is separate and additive -- `probe_url()`, plus the manifest
+parsers `hls_master_renditions()`, `hls_media_target()` and `mpd_renditions()`.
+Only that layer touches the network, and only it imports `urllib`.
 
 **A 4 KB `Range: bytes=0-4095` request is enough for every format here.** `moof`
 precedes `mdat`, and HLS requires a PAT+PMT at the head of every TS segment. You
@@ -336,7 +383,7 @@ catches manifests that misdeclare their own contents.
 
 ```
 src/mediasniff.py           the classifier
-tests/test_mediasniff.py    107 tests: corpus, short prefixes, fuzz, regressions
+tests/test_mediasniff.py    113 tests: corpus, short prefixes, fuzz, regressions
 tools/fetch_samples.sh      rebuild the corpus from public test vectors
 tools/make_samples.py       derive packed-audio / AES-128 / WebM samples
 tools/evaluate.py           measure separation across many renditions
