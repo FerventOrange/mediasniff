@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.pylint.main]
+init-hook = "import sys; sys.path.insert(0, 'src')"
+
+[tool.pylint."messages control"]
+disable = ["too-many-branches", "too-many-statements", "too-many-locals",
+           "too-many-return-statements", "too-many-nested-blocks"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests", "tools"]

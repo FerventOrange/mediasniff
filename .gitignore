@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Test corpus is fetched from public test vectors, never committed.
+# Rebuild with tools/fetch_samples.sh
+samples/*
+!samples/.gitkeep
+
+# tests/fixtures/ IS committed -- see tests/fixtures/README.md
