@@ -506,13 +506,20 @@ def _guess_nal_codec(headers: list[int]) -> str:
     return "h264/hevc"
 
 
-def _nal_chain(buf: bytes, probes: int = 3, headers: list[int] | None = None) -> bool:
+def _nal_chain(buf: bytes, probes: int = 3, headers: list[int] | None = None,
+               max_len: int | None = None) -> bool:
     """True if buf looks like length-prefixed NAL units (AVC/HEVC in mdat).
-    Appends each NAL header byte it validates to `headers`, if given."""
+
+    Appends each NAL header byte it validates to `headers`, if given. Pass
+    `max_len` -- the size of the payload actually containing these bytes -- to
+    bound the length field: a NAL cannot be longer than its own mdat, whereas a
+    random u32 averages two billion. Without that bound a single chance hit on
+    high-entropy data reads as video.
+    """
     i, ok = 0, 0
     while ok < probes and i + 5 <= len(buf):
         n = struct.unpack_from(">I", buf, i)[0]
-        if n == 0 or n > 16 << 20:
+        if n == 0 or n > 16 << 20 or (max_len is not None and n > max_len):
             return False
         hdr = buf[i + 4]
         if hdr & 0x80:                       # forbidden_zero_bit must be 0
@@ -705,15 +712,27 @@ def _classify_traf(info: TrafInfo) -> tuple[Kind, str, str, float]:
         score += 1.0
         why.append("first_sample_flags (sync sample marked)")
 
+    # Decide this first: a keyframe peak is positive video evidence, and it
+    # outranks a duration that merely coincides with a codec frame length.
+    sizes_early = info.sizes or (
+        [info.default_size] * info.sample_count if info.default_size else [])
+    decisive_peak = False
+    if len(sizes_early) >= 4:
+        mean_early = sum(sizes_early) / len(sizes_early)
+        decisive_peak = mean_early > 0 and max(sizes_early) / mean_early >= 3.0
+
     durs = info.durations or ([info.default_duration] if info.default_duration else [])
     audio_frame_timing = False
     if durs:
         uniform = len(set(durs)) == 1
         d = durs[0]
-        if uniform and d in AUDIO_FRAME_DURATIONS:
+        if uniform and d in AUDIO_FRAME_DURATIONS and not decisive_peak:
             audio_frame_timing = True
             score -= 2.5
             why.append(f"uniform sample duration {d} = a codec frame size")
+        elif uniform and d in AUDIO_FRAME_DURATIONS:
+            why.append(f"duration {d} matches a codec frame size, but a keyframe "
+                       "peak is present -- treating the match as coincidence")
         elif uniform:
             score -= 0.5
             why.append(f"uniform sample duration {d}")
@@ -917,11 +936,24 @@ def _parse_mp4(data: bytes, rep: Report) -> None:
             head = data[mdat_range[0] : min(mdat_range[1], mdat_range[0] + 8192)]
             guess: tuple[Kind, str] | None = None
             nal_headers: list[int] = []
+            # The mdat box header states its true size even when our Range
+            # request cut the payload short. Bounding by the bytes we happen to
+            # hold would reject a legitimate NAL in any segment larger than the
+            # prefix we fetched -- which is the normal case for this tool.
+            mdat_len = mdat_range[1] - mdat_range[0]
+            hdr_at = mdat_range[0] - 8
+            if hdr_at >= 0:
+                declared = struct.unpack_from(">I", data, hdr_at)[0]
+                if declared == 1 and hdr_at - 8 >= 0:
+                    declared = struct.unpack_from(">Q", data, mdat_range[0] - 16)[0]
+                    mdat_len = max(mdat_len, declared - 16)
+                elif declared > 8:
+                    mdat_len = max(mdat_len, declared - 8)
             if _vtt_sample_chain(head):
                 guess = (Kind.TEXT, "webvtt")
-            elif head[:1] == b"<" or b"<tt" in head[:64]:
+            elif _is_xml_text(head):
                 guess = (Kind.TEXT, "ttml")
-            elif _nal_chain(head, probes=12, headers=nal_headers):
+            elif _nal_chain(head, probes=12, headers=nal_headers, max_len=mdat_len):
                 guess = (Kind.VIDEO, _guess_nal_codec(nal_headers))
             elif _adts_chain(head):
                 guess = (Kind.AUDIO, "aac-adts")
@@ -1396,6 +1428,21 @@ def _resync(data: bytes, scan: int = 16384) -> tuple[int, Kind, str] | None:
 VTT_SAMPLE_BOXES = {b"vttc", b"vtte", b"vttx", b"vttC", b"payl", b"sttg", b"iden"}
 
 
+def _is_xml_text(buf: bytes) -> bool:
+    """True only for something that is actually XML/TTML.
+
+    A bare "<" occurs in one byte out of 256, which is frequent enough that
+    high-entropy payloads were being reported as subtitles. Require a real
+    marker and ASCII-clean leading bytes.
+    """
+    head = buf[:256].lstrip()[:128]
+    if not head.startswith(b"<"):
+        return False
+    if not all(32 <= c < 127 or c in (9, 10, 13) for c in head[:16]):
+        return False
+    return any(m in buf[:1024] for m in (b"<?xml", b"<tt", b"<TT", b"xmlns", b"<div", b"<p "))
+
+
 def _vtt_sample_chain(buf: bytes) -> bool:
     """True if buf is a run of ISO/IEC 14496-30 WebVTT sample boxes."""
     i, ok = 0, 0
@@ -1608,7 +1655,7 @@ def _parse_headless(data: bytes, rep: Report) -> bool:
         return True
 
     headers = []
-    if _nal_chain(head, probes=12, headers=headers):
+    if _nal_chain(head, probes=12, headers=headers, max_len=len(data)):
         rep.container = "headless media payload"
         rep.tracks = [Track(kind=Kind.VIDEO, codec=_guess_nal_codec(headers), observed=True,
                             note="length-prefixed NAL run with no container header")]
