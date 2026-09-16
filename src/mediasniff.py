@@ -568,6 +568,15 @@ def _adts_chain(buf: bytes, probes: int = 3) -> bool:
 # a 224x100 video clip can have a smaller mean sample than its own AAC track,
 # but never a smaller coefficient of variation.
 
+# Codec frame lengths, in the track's own timescale. Uniform sample durations
+# matching one of these are a *positive* signal for audio.
+#
+# They are not unambiguous, and the ambiguity is irreducible from a moof alone:
+# a sample duration is timescale/fps, the timescale lives in the init segment's
+# mdhd, and without it duration 1024 means either "an AAC frame" or "24 fps at
+# timescale 24576". 33 of these values are reachable by real video at standard
+# frame rates -- 512@12800 and 480@12000 are both 25 fps, 1024@24576 is 24 fps.
+# Fetch the init segment when the answer has to be certain.
 AUDIO_FRAME_DURATIONS = {1024, 2048, 1536, 1152, 960, 576, 512, 480, 320, 240}
 
 TRUN_DATA_OFFSET = 0x000001
@@ -673,6 +682,14 @@ def _scan_trafs(data: bytes) -> list[TrafInfo]:
 
 def _classify_traf(info: TrafInfo) -> tuple[Kind, str, str, float]:
     """Score one traf as video or audio from its sample table alone.
+
+    The scoring is deliberately asymmetric. Audio has a positive structural
+    tell -- a uniform sample duration equal to a codec frame length -- while
+    every video tell (B-frames, non-sync samples, a keyframe size peak) is a
+    marker of *complexity* that all-intra video legitimately lacks. So video
+    evidence may be concluded from its own presence, but audio is never
+    concluded from the mere absence of video evidence.
+
     Returns (kind, codec-guess, reasoning, signed score: >0 video, <0 audio)."""
     sizes = info.sizes or ([info.default_size] * info.sample_count if info.default_size else [])
     score = 0.0                                  # >0 video, <0 audio
@@ -722,12 +739,23 @@ def _classify_traf(info: TrafInfo) -> tuple[Kind, str, str, float]:
             elif not enough:
                 why.append(f"only {len(sizes)} samples -- too few to infer audio")
             elif cv <= 0.35 and peak <= 2.0:
-                score -= 3.0
+                # Flat frame sizes with no keyframe peak. This is what audio
+                # looks like -- and also exactly what all-intra CBR video looks
+                # like, because every frame is a keyframe and the rate control
+                # holds them the same size. Absence of video tells is NOT
+                # evidence of audio, so this only counts alongside a positive
+                # audio signal. Without one the fragment stays inconclusive and
+                # the payload tier, or the init segment, decides.
+                if audio_frame_timing:
+                    score -= 3.0
+                else:
+                    why.append("flat sizes but no audio frame timing -- "
+                               "consistent with all-intra video, not concluded")
             elif cv <= 0.55 and peak <= 1.8 and audio_frame_timing:
                 score -= 2.0                     # VBR audio: uneven but no peak
             elif cv >= 0.60:
                 score += 0.5                     # uneven with no peak: all-intra
-            if len(set(sizes)) == 1:
+            if len(set(sizes)) == 1 and audio_frame_timing:
                 score -= 1.5
                 why.append("constant sample size (CBR frames or PCM)")
 
@@ -1767,6 +1795,14 @@ def _verdict(rep: Report) -> Report:
         rep.verdict = "subtitles/text-only"
     elif any(t.kind is Kind.DATA for t in rep.tracks):
         rep.verdict = "metadata-only"
+    elif any(t.kind is Kind.UNKNOWN for t in rep.tracks):
+        # There is a track here; we simply cannot say what it carries. That is
+        # a different statement from "no media", and conflating the two hides
+        # the one case where this tool genuinely cannot answer: an unreadable
+        # payload whose sample table has no usable tells.
+        n = sum(1 for t in rep.tracks if t.kind is Kind.UNKNOWN)
+        rep.verdict = (f"{n} track(s) present, kind undetermined "
+                       "-- fetch the init segment to resolve")
     else:
         rep.verdict = "no identifiable media tracks"
 

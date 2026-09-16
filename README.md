@@ -347,6 +347,57 @@ Most remaining "disagreements" are the manifest being wrong, verified by hand:
 Content-based classification is not just a workaround for bad filenames. It
 catches manifests that misdeclare their own contents.
 
+## How much to trust it
+
+The three tiers are not equally reliable, and the tool reports which one it used
+so you can weigh the answer.
+
+**Tiers 1 and 2 are not inference.** Reading a PMT `stream_type`, a `moov`
+`hdlr` or a WebM `TrackType` is a field lookup. It is right unless the file is
+malformed. That covers every init segment, every TS segment and every WebM.
+
+**Tier 3, the `moof` sample table, is the only place a threshold exists** -- and
+it is deliberately asymmetric, because the evidence is:
+
+| | measured range | decides at | behaviour near the line |
+|---|---|---|---|
+| audio | −5.5 … −7.0 | ≤ −2.0 | tight cluster, never close |
+| video | −0.5 … +6.5 | ≥ +2.0 | often lands inside the band and defers to the payload tier |
+
+Audio has a *positive* structural tell: a uniform sample duration equal to a
+codec frame length. Every video tell -- B-frames, non-sync samples, a keyframe
+size peak -- is a marker of complexity that all-intra video legitimately lacks.
+So video may be concluded from its own evidence, but **audio is never concluded
+from the mere absence of video evidence**. Getting that backwards produced a
+confident wrong answer on all-intra CBR video with an encrypted payload; the
+gate that prevents it is pinned by `test_all_intra_video_is_not_concluded_to_be_audio`.
+
+Pushing from the other direction does not breach: pathological VBR audio with a
+peak 100x its mean still lands at +0.5, i.e. undetermined, never "video".
+
+### The one known-unsound case
+
+A sample duration is timescale/fps, and the timescale lives in the init
+segment's `mdhd`. From a `moof` alone, duration 512 is either an Opus frame or
+25 fps at timescale 12800 -- **33 of the codec frame lengths are reachable by
+real video at standard frame rates**. All-intra CBR video at such a duration,
+with an unreadable payload, still resolves to "audio" and is wrong. Absolute
+sample size cannot break the tie either: measured across the corpus, video runs
+86 B–16.7 KB per frame and audio 176 B–3 KB.
+
+This is irreducible from a media fragment alone, so it is asserted as a known
+limitation in `test_known_limitation_audio_frame_duration_collision` rather than
+left to be discovered. **Fetch the init segment when the answer must be
+certain** -- one extra request, and it turns the whole question back into a
+field lookup.
+
+### In short
+
+- With the init segment: essentially certain, because it is not a guess.
+- Without it: trust a confident *video* verdict; trust a confident *audio*
+  verdict except on all-intra tracks; treat *undetermined* as real information
+  rather than a failure. It is the system declining to guess.
+
 ## Caveats
 
 - **Whole-segment AES-128** (`EXT-X-KEY:METHOD=AES-128`) makes a fragment
@@ -383,7 +434,7 @@ catches manifests that misdeclare their own contents.
 
 ```
 src/mediasniff.py           the classifier
-tests/test_mediasniff.py    113 tests: corpus, short prefixes, fuzz, regressions
+tests/test_mediasniff.py    117 tests: corpus, short prefixes, fuzz, regressions
 tools/fetch_samples.sh      rebuild the corpus from public test vectors
 tools/make_samples.py       derive packed-audio / AES-128 / WebM samples
 tools/evaluate.py           measure separation across many renditions
