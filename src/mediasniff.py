@@ -34,6 +34,9 @@ import zlib
 from dataclasses import dataclass, field
 
 
+__version__ = "0.1.0"
+
+
 class Kind(str, enum.Enum):
     VIDEO = "video"
     AUDIO = "audio"
@@ -1903,7 +1906,9 @@ def format_report(name: str, rep: Report) -> str:
 # actually carry. Those two disagree often enough in the wild that showing both
 # is the point rather than a debugging aid.
 
-_UA = "mediasniff/1.0 (+https://github.com/FerventOrange/mediasniff)"
+# Derived from __version__ so the version announced to stream origins can never
+# drift from the one the project is tagged at.
+_UA = f"mediasniff/{__version__} (+https://github.com/FerventOrange/mediasniff)"
 
 _HLS_MEDIA_KINDS = {"AUDIO": "audio", "SUBTITLES": "subtitles",
                     "CLOSED-CAPTIONS": "closed captions"}
