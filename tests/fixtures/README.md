@@ -19,3 +19,8 @@ cannot reproduce them. Each one caused a real bug.
 | `ts_audio_declared_absent.ts` | mycloudstream.io live TV | Both the HLS manifest (`CODECS="avc1.64001f,mp4a.40.2"`) and the PMT declare an AAC stream, but the segment carries 350 video packets and **zero** audio packets. The case the declared-vs-observed split exists for. |
 
 Captured 2026-09-16. All from publicly listed, freely-available streams.
+
+**Licensing:** these captures are fragments of third-party broadcast and radio
+streams, retained as test vectors only. They are not covered by the project's
+MIT license and are not redistributable as media. Each is a few seconds long,
+and several are unplayable in isolation (no init segment, or CSA-scrambled).

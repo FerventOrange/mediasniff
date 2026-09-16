@@ -353,3 +353,12 @@ The corpus is deliberately adversarial: four `.dash` files with byte-identical
 magic and brands (two audio, two video), two `.ts` files of identical length
 whose names differ by one infix, and a WebVTT file that Apple serves under a
 `.mp4`-shaped path.
+
+## License
+
+MIT -- see [LICENSE](LICENSE). Use it on your own streams freely.
+
+The captures in `tests/fixtures/` are **not** covered by that license: they are
+short fragments of third-party broadcast and radio streams, included solely as
+test vectors because each one caught a real bug. See
+[tests/fixtures/README.md](tests/fixtures/README.md) for provenance.
