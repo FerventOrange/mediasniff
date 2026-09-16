@@ -7,6 +7,7 @@ declaration. The manifest is the answer key and is never an input to sniff().
 """
 
 import os
+import random
 import struct
 
 import pytest
@@ -603,6 +604,88 @@ def _fragment(duration, sizes, payload):
 _ALL_INTRA_CBR = [8000 + ((i * 37) % 400) for i in range(30)]
 
 
+def _noise(n, seed=0):
+    """Reproducible stand-in for an encrypted payload.
+
+    Seeded rather than os.urandom so a failure can be replayed. The randomised
+    sweep below is what actually guards against chance syncword hits -- a fixed
+    seed alone could simply be a lucky draw.
+    """
+    return random.Random(seed).randbytes(n)
+
+
+def test_nal_bound_uses_the_declared_mdat_size_not_the_bytes_we_hold():
+    """Bounding the NAL length by the payload we happen to have rejects real
+    video, because this tool reads 64 KB prefixes by design and a legitimate
+    slice in a larger segment exceeds that. The mdat header states its true
+    size even when the Range request cut the payload short.
+
+    Caught by the wild sweep: a live 1080p fMP4 stream went unresolved.
+    """
+    nals = [(11, 0x06), (40000, 0x65), (900, 0x41)]
+    payload = b"".join(struct.pack(">I", n) + bytes([h]) + b"\x00" * min(n - 1, 600)
+                       for n, h in nals)
+    # mdat declares 40 KB more than we actually hold -- the truncated-fetch case
+    declared = len(payload) + 40000
+    mdat = struct.pack(">I", declared + 8) + b"mdat" + payload
+    moof_traf = _fragment(3600, [n for n, _ in nals], b"")[:-8]
+    blob = moof_traf + mdat
+
+    assert ms._nal_chain(payload, probes=3, max_len=len(payload)) is False, (
+        "bounding by the held bytes should reject the 40 KB NAL -- that is the bug")
+    assert ms._nal_chain(payload, probes=3, max_len=declared)
+    assert ms.sniff(blob).verdict.startswith("video-only")
+
+
+def test_a_keyframe_peak_outranks_a_coincidental_duration_match():
+    """33 codec frame lengths are reachable by video at standard frame rates,
+    so duration 512 can mean 25 fps at timescale 12800. A keyframe size peak is
+    positive evidence of video; a duration that merely coincides is not evidence
+    of audio. Coincidence must not veto evidence.
+
+    Caught by the wild sweep: a real 1080p stream at duration 512 with a 12x
+    keyframe peak was scored down into 'undetermined'.
+    """
+    peaky = [700] * 29 + [9000]          # one keyframe among inter frames
+    kind, _c, why, score = ms._classify_traf(
+        ms._scan_trafs(_fragment(512, peaky, _noise(sum(peaky))))[0])
+    assert kind is ms.Kind.VIDEO, f"{kind.value} at {score:+.1f}: {why}"
+    assert "coincidence" in why
+
+    # ...but with no peak, the duration match still counts for audio
+    flat = [418] * 200
+    kind, _c, _why, _s = ms._classify_traf(
+        ms._scan_trafs(_fragment(512, flat, _noise(sum(flat))))[0])
+    assert kind is ms.Kind.AUDIO
+
+
+def test_high_entropy_payload_never_flips_the_verdict():
+    """CI caught this on its first PR: the payload tier could override the
+    sample table on a single chance hit in random bytes, flipping ~0.5% of runs
+    to the wrong answer -- about one red job in five across the matrix.
+
+    Two weak detectors did it. A bare "<" at offset 0 occurs once per 256 bytes
+    and claimed subtitles; and a length-prefixed NAL check accepted one unit
+    whose random u32 length averaged two billion. Both are now bounded, so a
+    payload that carries no real signal leaves the sample table's verdict alone.
+    """
+    cases = [
+        (1024, [418] * 200, "audio-only"),
+        (1536, [1792] * 120, "audio-only"),
+        (2048, [300] * 100, "audio-only"),
+        (3600, _ALL_INTRA_CBR, "1 track"),
+    ]
+    rng = random.Random(1234)
+    violations = []
+    for draw in range(120):
+        for duration, sizes, want in cases:
+            payload = rng.randbytes(sum(sizes))
+            verdict = ms.sniff(_fragment(duration, sizes, payload)).verdict
+            if not verdict.startswith(want):
+                violations.append((draw, duration, verdict))
+    assert not violations, f"{len(violations)} of 480 draws flipped: {violations[:3]}"
+
+
 def test_all_intra_video_is_not_concluded_to_be_audio():
     """The defect this gate exists for.
 
@@ -611,7 +694,7 @@ def test_all_intra_video_is_not_concluded_to_be_audio():
     encrypted there is no syncword to break the tie. Scoring it as audio
     produced a *confident* wrong answer with no fallback.
     """
-    blob = _fragment(3600, _ALL_INTRA_CBR, os.urandom(sum(_ALL_INTRA_CBR)))
+    blob = _fragment(3600, _ALL_INTRA_CBR, _noise(sum(_ALL_INTRA_CBR)))
     kind, _codec, _why, score = ms._classify_traf(ms._scan_trafs(blob)[0])
     assert kind is ms.Kind.UNKNOWN, f"claimed {kind.value} at score {score:+.1f}"
     assert -2.0 < score < 2.0
@@ -627,7 +710,7 @@ def test_all_intra_video_is_not_concluded_to_be_audio():
 
 def test_undetermined_is_not_reported_as_no_media():
     """"A track we cannot type" and "no media here" are different claims."""
-    blob = _fragment(3600, _ALL_INTRA_CBR, os.urandom(sum(_ALL_INTRA_CBR)))
+    blob = _fragment(3600, _ALL_INTRA_CBR, _noise(sum(_ALL_INTRA_CBR)))
     rep = ms.sniff(blob)
     assert rep.tracks, "the track exists even though its kind does not resolve"
     assert "no identifiable media tracks" not in rep.verdict
@@ -638,7 +721,7 @@ def test_the_gate_does_not_cost_us_real_audio():
     for duration, sizes in ((1024, [418] * 200),      # AAC-LC CBR
                             (1536, [1792] * 120),     # AC-3
                             (2048, [300] * 100)):     # HE-AAC
-        blob = _fragment(duration, sizes, os.urandom(sum(sizes)))
+        blob = _fragment(duration, sizes, _noise(sum(sizes)))
         assert ms.sniff(blob).verdict.startswith("audio-only"), duration
 
 
@@ -653,7 +736,7 @@ def test_known_limitation_audio_frame_duration_collision():
     """
     colliding = sorted(ms.AUDIO_FRAME_DURATIONS & {512, 1024, 480, 960})
     assert colliding, "these are the values reachable by video at 24/25/30 fps"
-    blob = _fragment(512, _ALL_INTRA_CBR, os.urandom(sum(_ALL_INTRA_CBR)))
+    blob = _fragment(512, _ALL_INTRA_CBR, _noise(sum(_ALL_INTRA_CBR)))
     rep = ms.sniff(blob)
     assert rep.verdict.startswith("audio-only")        # known-wrong, by design
     assert rep.confidence != "high", "at least never claim high confidence here"
