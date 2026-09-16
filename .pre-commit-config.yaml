@@ -1,0 +1,46 @@
+# Mirrors the house style used in Snow-Report, minus the hooks this repo does
+# not use. Run `pre-commit install` once after cloning.
+#
+# tests/fixtures/ is excluded globally: those files are byte-exact captures from
+# live streams, each pinning a specific bug. A whitespace fixer "correcting" one
+# would silently change what is being tested.
+exclude: ^tests/fixtures/
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+
+  - repo: https://github.com/psf/black
+    rev: 26.5.1
+    hooks:
+      - id: black
+
+  - repo: https://github.com/pycqa/isort
+    rev: 9.0.1
+    hooks:
+      - id: isort
+
+  - repo: local
+    hooks:
+      # Local rather than the upstream mirror: pylint needs to import the
+      # project to resolve its own module, and reads its config from
+      # pyproject.toml.
+      - id: pylint
+        name: pylint
+        entry: python3 -m pylint
+        language: system
+        types: [python]
+
+      - id: pytest
+        name: pytest
+        entry: python3 -m pytest tests -q
+        language: system
+        types: [python]
+        pass_filenames: false

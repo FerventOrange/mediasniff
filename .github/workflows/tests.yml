@@ -5,13 +5,33 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install linters
+        run: python -m pip install --upgrade pip black isort pylint pytest
+      - name: black
+        run: python -m black --check --diff src tests tools
+      - name: isort
+        run: python -m isort --check-only --diff src tests tools
+      - name: pylint
+        run: python -m pylint src tests tools
+
   test:
     runs-on: ubuntu-latest
     strategy:
+      # Report every failing version rather than stopping at the first.
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
@@ -25,16 +45,53 @@ jobs:
 
       # The fetchable corpus in samples/ is deliberately not committed -- it is
       # ~4 MB of third-party stream captures. Tests that need it skip cleanly.
-      # These few samples are synthesised locally with no network, so they cost
-      # nothing and take CI from 22 tests to 35.
+      # These few samples are synthesised locally with no network.
       - name: Build the offline samples
         run: python tools/make_samples.py
 
       - name: Run tests
-        run: python -m pytest tests -q
+        run: python -m pytest tests -q --junitxml=results.xml
 
-      - name: Compile-check the tools
+      # A suite that collects nothing, or skips everything, still exits 0.
+      # Without this a broken conftest or a missing corpus would go green while
+      # testing nothing at all, which is the failure mode this whole job exists
+      # to prevent.
+      - name: Assert the suite actually ran
+        run: |
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          suite = ET.parse("results.xml").getroot()
+          if suite.tag == "testsuites":
+              suite = suite[0]
+          total = int(suite.get("tests", 0))
+          skipped = int(suite.get("skipped", 0))
+          failures = int(suite.get("failures", 0))
+          errors = int(suite.get("errors", 0))
+          passed = total - skipped - failures - errors
+          print(f"{passed} passed, {skipped} skipped, {failures} failed, {errors} errors")
+          MINIMUM = 35
+          if failures or errors:
+              sys.exit("failures or errors present")
+          if passed < MINIMUM:
+              sys.exit(f"only {passed} tests passed, expected at least {MINIMUM} -- "
+                       "the suite is not running what it should be")
+          PY
+
+      - name: Compile-check the sources
         run: python -m py_compile src/mediasniff.py tools/*.py
 
       - name: Shell-check the corpus fetcher
         run: bash -n tools/fetch_samples.sh
+
+  # Single gate for branch protection: green only when every job above is
+  # green. A skipped or cancelled job is not a pass.
+  all-checks:
+    if: always()
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to have succeeded
+        run: |
+          echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }}"
+          [ "${{ needs.lint.result }}" = "success" ] || exit 1
+          [ "${{ needs.test.result }}" = "success" ] || exit 1

@@ -28,6 +28,8 @@ Usage:
     python3 tools/wild.py --source all --sample 200 [--seed 1] [--save-failures]
 """
 
+# pylint: disable=missing-function-docstring,redefined-outer-name,global-statement,wrong-import-position
+
 import argparse
 import collections
 import json
@@ -55,8 +57,10 @@ RADIO_API = "https://de1.api.radio-browser.info/json/stations/topclick/400"
 # tv.garden's channel list. The original TVGarden repo is archived and points
 # here. Its webcams/ category is 100% YouTube embeds, which are not directly
 # fetchable bytes, so only the TV list is used.
-TVGARDEN = ("https://raw.githubusercontent.com/famelack/famelack-channels/main"
-            "/tv/raw/categories/all.json")
+TVGARDEN = (
+    "https://raw.githubusercontent.com/famelack/famelack-channels/main"
+    "/tv/raw/categories/all.json"
+)
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) mediasniff/wild"
 SEGMENT_BYTES = 65536
@@ -101,6 +105,7 @@ def fetch(url, nbytes=None, timeout=TIMEOUT, icy=False):
 # --------------------------------------------------------------------------
 # sources
 # --------------------------------------------------------------------------
+
 
 def source_iptv(dash_only=False):
     blob, _ = fetch(IPTV_API, timeout=90)
@@ -162,6 +167,7 @@ def source_tvgarden(include_geoblocked=False):
 # --------------------------------------------------------------------------
 # resolution: directory entry -> one media fragment
 # --------------------------------------------------------------------------
+
 
 def truth_from_master(text):
     """Ground truth from an HLS master playlist's own attributes.
@@ -243,7 +249,7 @@ def resolve_dash(text, base, want_media=False):
                     if seg is not None:
                         first_t = seg.get("t") or "0"
 
-                def _sub(match):
+                def _sub(match, start=start, first_t=first_t):
                     var, fmt = match.group(1), match.group(2)
                     val = start if var == "Number" else first_t
                     # Keep the zero-pad flag: $Number%04d$ must render "0001",
@@ -273,20 +279,36 @@ def first_uri(text, base):
 
 
 def probe(name, url, kind):
-    row = {"name": name[:38], "url": url, "kind": kind, "status": "",
-           "container": "", "verdict": "", "confidence": "", "truth": None,
-           "blob": b"", "fragment_url": "", "truncated": False}
+    row = {
+        "name": name[:38],
+        "url": url,
+        "kind": kind,
+        "status": "",
+        "container": "",
+        "verdict": "",
+        "confidence": "",
+        "truth": None,
+        "blob": b"",
+        "fragment_url": "",
+        "truncated": False,
+    }
     if kind.startswith("radio:"):
         row["truth"] = "audio"
 
     is_radio = kind.startswith("radio:")
     try:
         blob, final = fetch(url, SEGMENT_BYTES, icy=is_radio)
-    except (urllib.error.URLError, urllib.error.HTTPError, ssl.SSLError,
-            ConnectionError, TimeoutError, OSError) as exc:
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        ssl.SSLError,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    ) as exc:
         row["status"] = f"unreachable: {type(exc).__name__}"
         return row
-    except Exception as exc:                                 # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         row["status"] = f"error: {type(exc).__name__}"
         return row
 
@@ -295,7 +317,7 @@ def probe(name, url, kind):
         alt = urllib.parse.urljoin(final, ";")
         try:
             blob, final = fetch(alt, SEGMENT_BYTES, icy=True)
-        except Exception:                                    # noqa: BLE001
+        except Exception:  # noqa: BLE001
             pass
 
     for _hop in range(4):
@@ -303,8 +325,9 @@ def probe(name, url, kind):
 
         if rep.container == "dash-mpd":
             try:
-                truth, nxt = resolve_dash(blob.decode("utf-8", "replace"), final,
-                                          want_media=DASH_WANT_MEDIA)
+                truth, nxt = resolve_dash(
+                    blob.decode("utf-8", "replace"), final, want_media=DASH_WANT_MEDIA
+                )
             except ET.ParseError:
                 row["status"] = "unparseable MPD"
                 return row
@@ -314,7 +337,7 @@ def probe(name, url, kind):
             row["truth"] = truth
             try:
                 blob, final = fetch(nxt, SEGMENT_BYTES)
-            except Exception as exc:                         # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 row["status"] = f"dash segment unreachable: {type(exc).__name__}"
                 return row
             continue
@@ -329,7 +352,7 @@ def probe(name, url, kind):
                 return row
             try:
                 blob, final = fetch(nxt, SEGMENT_BYTES)
-            except Exception as exc:                         # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 row["status"] = f"child unreachable: {type(exc).__name__}"
                 return row
             continue
@@ -339,9 +362,15 @@ def probe(name, url, kind):
             # condition rather than a classification failure.
             row["status"] = "empty response"
             return row
-        row.update(container=rep.container, verdict=rep.verdict,
-                   confidence=rep.confidence, status="ok", blob=blob,
-                   fragment_url=final, truncated=rep.truncated)
+        row.update(
+            container=rep.container,
+            verdict=rep.verdict,
+            confidence=rep.confidence,
+            status="ok",
+            blob=blob,
+            fragment_url=final,
+            truncated=rep.truncated,
+        )
         return row
 
     row["status"] = "too many hops"
@@ -350,14 +379,19 @@ def probe(name, url, kind):
 
 def normalize(verdict):
     v = verdict.split("[")[0].split("<-")[0].strip()
-    for prefix, label in (("muxed", "muxed"), ("video-only", "video"),
-                          ("audio-only", "audio"), ("subtitles", "text")):
+    for prefix, label in (
+        ("muxed", "muxed"),
+        ("video-only", "video"),
+        ("audio-only", "audio"),
+        ("subtitles", "text"),
+    ):
         if v.startswith(prefix):
             return label
     return "unknown"
 
 
 # --------------------------------------------------------------------------
+
 
 def report(rows, save_failures):
     ok = [r for r in rows if r["status"] == "ok"]
@@ -378,25 +412,38 @@ def report(rows, save_failures):
     wrong = [r for r in checked if normalize(r["verdict"]) != r["truth"]]
     if checked:
         pct = 100.0 * (len(checked) - len(wrong)) / len(checked)
-        print(f"\nvs declared type: {len(checked) - len(wrong)}/{len(checked)} agree "
-              f"({pct:.0f}%)"
-              + (f"; {len(opaque)} excluded as encrypted-opaque" if opaque else ""))
+        print(
+            f"\nvs declared type: {len(checked) - len(wrong)}/{len(checked)} agree "
+            f"({pct:.0f}%)" + (f"; {len(opaque)} excluded as encrypted-opaque" if opaque else "")
+        )
         for r in wrong:
-            print(f"    declared={r['truth']:<6} sniffed={normalize(r['verdict']):<7} "
-                  f"{r['container']:<22} {r['name']}")
+            print(
+                f"    declared={r['truth']:<6} sniffed={normalize(r['verdict']):<7} "
+                f"{r['container']:<22} {r['name']}"
+            )
             print(f"        {r['fragment_url'][:104]}")
 
-    problems = [r for r in ok if r["container"] not in ("opaque", "html", "json", "text")
-                and (normalize(r["verdict"]) == "unknown"
-                     or r["confidence"] == "low" or r["container"] == "unknown")]
+    problems = [
+        r
+        for r in ok
+        if r["container"] not in ("opaque", "html", "json", "text")
+        and (
+            normalize(r["verdict"]) == "unknown"
+            or r["confidence"] == "low"
+            or r["container"] == "unknown"
+        )
+    ]
     enc = [r for r in ok if r["container"] == "opaque"]
     junk = [r for r in ok if r["container"] in ("html", "json", "text")]
-    print(f"\nencrypted (correctly opaque): {len(enc)}    "
-          f"dead links serving html/json/text: {len(junk)}")
+    print(
+        f"\nencrypted (correctly opaque): {len(enc)}    "
+        f"dead links serving html/json/text: {len(junk)}"
+    )
     print(f"unresolved or low confidence: {len(problems)}")
     for r in problems:
-        print(f"    {r['container']:<20} {r['confidence']:<7} "
-              f"{r['verdict'][:36]:<36} {r['name']}")
+        print(
+            f"    {r['container']:<20} {r['confidence']:<7} " f"{r['verdict'][:36]:<36} {r['name']}"
+        )
         print(f"        {r['fragment_url'][:104]}")
         if save_failures and r["blob"]:
             out = os.path.join(ROOT, "samples", "wild")
@@ -414,31 +461,36 @@ def report(rows, save_failures):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", default="all",
-                    choices=["all", "iptv", "dash", "radio", "freetv", "tvgarden"])
+    ap.add_argument(
+        "--source", default="all", choices=["all", "iptv", "dash", "radio", "freetv", "tvgarden"]
+    )
     ap.add_argument("--sample", type=int, default=120)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--save-failures", action="store_true")
-    ap.add_argument("--dash-media", action="store_true",
-                    help="resolve DASH to a media segment (moof+mdat, the inferred "
-                         "tier) instead of an init segment (moov, the declared tier)")
+    ap.add_argument(
+        "--dash-media",
+        action="store_true",
+        help="resolve DASH to a media segment (moof+mdat, the inferred "
+        "tier) instead of an init segment (moov, the declared tier)",
+    )
     args = ap.parse_args()
-    global DASH_WANT_MEDIA                                   # noqa: PLW0603
+    global DASH_WANT_MEDIA  # noqa: PLW0603
     DASH_WANT_MEDIA = args.dash_media
 
     rng = random.Random(args.seed)
     buckets = []
-    want = {"all": ["iptv", "dash", "radio", "freetv", "tvgarden"]}.get(
-        args.source, [args.source])
+    want = {"all": ["iptv", "dash", "radio", "freetv", "tvgarden"]}.get(args.source, [args.source])
     for src in want:
         try:
-            got = {"iptv": lambda: source_iptv(False),
-                   "dash": lambda: source_iptv(True),
-                   "radio": source_radio,
-                   "freetv": source_freetv,
-                   "tvgarden": source_tvgarden}[src]()
-        except Exception as exc:                             # noqa: BLE001
+            got = {
+                "iptv": lambda: source_iptv(False),
+                "dash": lambda: source_iptv(True),
+                "radio": source_radio,
+                "freetv": source_freetv,
+                "tvgarden": source_tvgarden,
+            }[src]()
+        except Exception as exc:  # noqa: BLE001
             print(f"  source {src} unavailable: {type(exc).__name__}")
             continue
         print(f"  {src}: {len(got)} entries")

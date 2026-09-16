@@ -29,34 +29,39 @@ catches the opposite case of a fragment that simply has no keyframe yet.
 from __future__ import annotations
 
 import enum
+import math
 import struct
 import zlib
 from dataclasses import dataclass, field
-
 
 __version__ = "0.1.0"
 
 
 class Kind(str, enum.Enum):
+    """What a track carries."""
+
     VIDEO = "video"
     AUDIO = "audio"
     TEXT = "text"
-    DATA = "data"          # ID3 timed metadata, SCTE-35, emsg, etc.
+    DATA = "data"  # ID3 timed metadata, SCTE-35, emsg, etc.
     UNKNOWN = "unknown"
 
 
 @dataclass
 class Track:
+    """One elementary stream within a fragment."""
+
     kind: Kind
     codec: str = ""
     track_id: int | None = None
-    pid: int | None = None          # MPEG-TS only
-    declared: bool = False          # named by an index (PMT / moov / Tracks)
-    observed: bool = False          # elementary data actually seen in bytes
-    packets: int = 0                # TS packets or samples attributed to it
+    pid: int | None = None  # MPEG-TS only
+    declared: bool = False  # named by an index (PMT / moov / Tracks)
+    observed: bool = False  # elementary data actually seen in bytes
+    packets: int = 0  # TS packets or samples attributed to it
     note: str = ""
 
     def __str__(self) -> str:
+        """One line describing this track, for the CLI."""
         loc = f"pid 0x{self.pid:04x}" if self.pid is not None else f"trak {self.track_id}"
         flags = "".join(c for c, on in (("D", self.declared), ("O", self.observed)) if on)
         return f"{self.kind.value:<7} {self.codec:<10} {loc:<12} [{flags}]" + (
@@ -66,19 +71,25 @@ class Track:
 
 @dataclass
 class Report:
+    """The result of classifying one fragment."""
+
     container: str = "unknown"
     verdict: str = "unknown"
     tracks: list[Track] = field(default_factory=list)
     brands: list[str] = field(default_factory=list)
-    encrypted: str = ""             # "", "aes-128-full", "sample-aes", "cenc"
-    drm: "Drm" = field(default_factory=lambda: Drm())
-    is_init: bool = False           # init segment (no media payload)
-    is_playlist: bool = False       # you were handed a manifest, not a fragment
-    truncated: bool = False         # these bytes are a prefix, not a whole fragment
-    confidence: str = "low"         # low | medium | high
+    encrypted: str = ""  # "", "aes-128-full", "sample-aes", "cenc"
+    # The lambda is load-bearing, not redundant: Drm is defined further down,
+    # and default_factory is evaluated at class-creation time. pylint flags this
+    # as unnecessary-lambda; it is wrong here.
+    drm: "Drm" = field(default_factory=lambda: Drm())  # pylint: disable=unnecessary-lambda
+    is_init: bool = False  # init segment (no media payload)
+    is_playlist: bool = False  # you were handed a manifest, not a fragment
+    truncated: bool = False  # these bytes are a prefix, not a whole fragment
+    confidence: str = "low"  # low | medium | high
     evidence: list[str] = field(default_factory=list)
 
     def kinds(self, *, observed_only: bool = False) -> set[Kind]:
+        """The media kinds this fragment carries, optionally only those seen."""
         return {
             t.kind
             for t in self.tracks
@@ -99,11 +110,11 @@ TS_STREAM_TYPES: dict[int, tuple[Kind, str]] = {
     0x03: (Kind.AUDIO, "mp2"),
     0x04: (Kind.AUDIO, "mp3"),
     0x05: (Kind.DATA, "sections"),
-    0x06: (Kind.UNKNOWN, "pes-private"),   # resolve via descriptors
+    0x06: (Kind.UNKNOWN, "pes-private"),  # resolve via descriptors
     0x0F: (Kind.AUDIO, "aac-adts"),
     0x10: (Kind.VIDEO, "mpeg4visual"),
     0x11: (Kind.AUDIO, "aac-latm"),
-    0x15: (Kind.DATA, "id3-metadata"),     # HLS timed metadata rides here
+    0x15: (Kind.DATA, "id3-metadata"),  # HLS timed metadata rides here
     0x1B: (Kind.VIDEO, "h264"),
     0x1C: (Kind.AUDIO, "aac-raw"),
     0x1F: (Kind.VIDEO, "svc"),
@@ -126,7 +137,7 @@ TS_STREAM_TYPES: dict[int, tuple[Kind, str]] = {
     0xCF: (Kind.AUDIO, "aac [SAMPLE-AES]"),
     0xDB: (Kind.VIDEO, "h264 [SAMPLE-AES]"),
     0x1A: (Kind.DATA, "iso14496-sections"),
-    0x86: (Kind.DATA, "scte35"),   # SCTE-35 splice_info; Blu-ray reuses it for DTS-HD MA
+    0x86: (Kind.DATA, "scte35"),  # SCTE-35 splice_info; Blu-ray reuses it for DTS-HD MA
 }
 
 # Registration descriptor (tag 0x05) format_identifiers seen in the wild.
@@ -171,9 +182,9 @@ def _ts_packet_ok(data: bytes, off: int) -> bool:
     MPEG-TS lock before this check existed."""
     if off + 4 > len(data) or data[off] != 0x47:
         return False
-    if data[off + 1] & 0x80:                       # transport_error_indicator
+    if data[off + 1] & 0x80:  # transport_error_indicator
         return False
-    if (data[off + 3] >> 4) & 0x03 == 0:           # adaptation_field_control 0 is reserved
+    if (data[off + 3] >> 4) & 0x03 == 0:  # adaptation_field_control 0 is reserved
         return False
     return True
 
@@ -244,7 +255,7 @@ def _ts_sections(data: bytes, size: int, start: int, pid_wanted: int) -> list[by
         if afc == 2 or p >= len(pkt):
             continue
         if payload_start:
-            p += 1 + pkt[p]          # pointer_field
+            p += 1 + pkt[p]  # pointer_field
             if p >= len(pkt):
                 continue
             buf = bytearray(pkt[p:])
@@ -354,17 +365,21 @@ def _parse_ts(data: bytes, size: int, start: int, rep: Report) -> None:
     if scrambled:
         rep.encrypted = "dvb-csa"
         rep.drm.scheme = "DVB-CSA / conditional access"
-        rep.drm.note = ("PSI stays in the clear so tracks are still typed from "
-                        "the PMT; PES headers are scrambled")
+        rep.drm.note = (
+            "PSI stays in the clear so tracks are still typed from "
+            "the PMT; PES headers are scrambled"
+        )
         rep.evidence.append(
             f"transport_scrambling_control set on {len(scrambled)} PID(s) -- "
-            "conditional access, so PES stream_id typing is unavailable")
+            "conditional access, so PES stream_id typing is unavailable"
+        )
 
     prefix = (len(data) - start) % size != 0
     for t in tracks.values():
         if t.declared and not t.observed:
-            t.note = (t.note + (" declared, not in this prefix" if prefix
-                                else " DECLARED BUT ABSENT")).strip()
+            t.note = (
+                t.note + (" declared, not in this prefix" if prefix else " DECLARED BUT ABSENT")
+            ).strip()
         if t.observed and not t.declared and t.packets > 2:
             t.note = (t.note + " not in PMT").strip()
 
@@ -389,7 +404,8 @@ def _parse_ts(data: bytes, size: int, start: int, rep: Report) -> None:
     if rep.truncated:
         rep.evidence.append(
             f"truncated: {(len(data) - start) % size} bytes past the last whole "
-            f"{size}-byte packet, so absent tracks may simply be later in the segment")
+            f"{size}-byte packet, so absent tracks may simply be later in the segment"
+        )
 
     typed = any(t.kind in (Kind.VIDEO, Kind.AUDIO, Kind.TEXT) for t in tracks.values())
     if not typed:
@@ -407,8 +423,22 @@ def _parse_ts(data: bytes, size: int, start: int, rep: Report) -> None:
 # --------------------------------------------------------------------------
 
 ISOBMFF_TOP = {
-    b"ftyp", b"styp", b"moov", b"moof", b"mdat", b"free", b"skip", b"sidx",
-    b"ssix", b"emsg", b"prft", b"mfra", b"meta", b"pdin", b"uuid", b"wide",
+    b"ftyp",
+    b"styp",
+    b"moov",
+    b"moof",
+    b"mdat",
+    b"free",
+    b"skip",
+    b"sidx",
+    b"ssix",
+    b"emsg",
+    b"prft",
+    b"mfra",
+    b"meta",
+    b"pdin",
+    b"uuid",
+    b"wide",
 }
 
 HANDLER_KINDS = {
@@ -426,22 +456,63 @@ HANDLER_KINDS = {
 # Sample entry 4CCs -> friendly codec name. Encrypted tracks use encv/enca and
 # hide the real 4CC under sinf/frma, which _mp4_boxes walks into.
 SAMPLE_ENTRIES = {
-    b"avc1": "h264", b"avc3": "h264", b"avc2": "h264", b"avc4": "h264",
-    b"hvc1": "hevc", b"hev1": "hevc", b"dvh1": "dolby-vision", b"dvhe": "dolby-vision",
-    b"vvc1": "vvc", b"vvi1": "vvc",
-    b"vp08": "vp8", b"vp09": "vp9", b"av01": "av1",
-    b"mp4v": "mpeg4visual", b"jpeg": "jpeg", b"j2ki": "jpeg2000",
-    b"mp4a": "aac", b"ac-3": "ac3", b"ec-3": "eac3", b"ac-4": "ac4",
-    b"Opus": "opus", b"fLaC": "flac", b"alac": "alac", b"dtsc": "dts",
-    b"dtse": "dts", b"dtsh": "dts", b"dtsl": "dts", b"mlpa": "truehd",
-    b"samr": "amr", b"sawb": "amr-wb", b"sowt": "pcm", b"ipcm": "pcm",
-    b"wvtt": "webvtt", b"stpp": "ttml", b"tx3g": "3gpp-text", b"c608": "cea608",
-    b"urim": "timed-metadata", b"mett": "timed-metadata", b"metx": "timed-metadata",
+    b"avc1": "h264",
+    b"avc3": "h264",
+    b"avc2": "h264",
+    b"avc4": "h264",
+    b"hvc1": "hevc",
+    b"hev1": "hevc",
+    b"dvh1": "dolby-vision",
+    b"dvhe": "dolby-vision",
+    b"vvc1": "vvc",
+    b"vvi1": "vvc",
+    b"vp08": "vp8",
+    b"vp09": "vp9",
+    b"av01": "av1",
+    b"mp4v": "mpeg4visual",
+    b"jpeg": "jpeg",
+    b"j2ki": "jpeg2000",
+    b"mp4a": "aac",
+    b"ac-3": "ac3",
+    b"ec-3": "eac3",
+    b"ac-4": "ac4",
+    b"Opus": "opus",
+    b"fLaC": "flac",
+    b"alac": "alac",
+    b"dtsc": "dts",
+    b"dtse": "dts",
+    b"dtsh": "dts",
+    b"dtsl": "dts",
+    b"mlpa": "truehd",
+    b"samr": "amr",
+    b"sawb": "amr-wb",
+    b"sowt": "pcm",
+    b"ipcm": "pcm",
+    b"wvtt": "webvtt",
+    b"stpp": "ttml",
+    b"tx3g": "3gpp-text",
+    b"c608": "cea608",
+    b"urim": "timed-metadata",
+    b"mett": "timed-metadata",
+    b"metx": "timed-metadata",
 }
 
 _CONTAINER_BOXES = {
-    b"moov", b"trak", b"mdia", b"minf", b"stbl", b"moof", b"traf", b"mvex",
-    b"edts", b"dinf", b"udta", b"sinf", b"schi", b"mfra", b"stsd",
+    b"moov",
+    b"trak",
+    b"mdia",
+    b"minf",
+    b"stbl",
+    b"moof",
+    b"traf",
+    b"mvex",
+    b"edts",
+    b"dinf",
+    b"udta",
+    b"sinf",
+    b"schi",
+    b"mfra",
+    b"stsd",
 }
 
 
@@ -473,14 +544,47 @@ def _mp4_boxes(data: bytes, start: int = 0, end: int | None = None, depth: int =
             yield from _mp4_boxes(data, body + skip, body_end, depth + 1)
         elif btype in SAMPLE_ENTRIES or btype in (b"encv", b"enca", b"encs", b"enct"):
             # VisualSampleEntry = 78 bytes, AudioSampleEntry = 28, others 8.
-            head = 78 if btype in (b"encv",) or SAMPLE_ENTRIES.get(btype, "") in (
-                "h264", "hevc", "vvc", "vp8", "vp9", "av1", "mpeg4visual",
-                "dolby-vision", "jpeg", "jpeg2000",
-            ) else 28 if btype in (b"enca",) or btype in (
-                b"mp4a", b"ac-3", b"ec-3", b"ac-4", b"Opus", b"fLaC", b"alac",
-                b"dtsc", b"dtse", b"dtsh", b"dtsl", b"mlpa", b"samr", b"sawb",
-                b"sowt", b"ipcm",
-            ) else 8
+            head = (
+                78
+                if btype in (b"encv",)
+                or SAMPLE_ENTRIES.get(btype, "")
+                in (
+                    "h264",
+                    "hevc",
+                    "vvc",
+                    "vp8",
+                    "vp9",
+                    "av1",
+                    "mpeg4visual",
+                    "dolby-vision",
+                    "jpeg",
+                    "jpeg2000",
+                )
+                else (
+                    28
+                    if btype in (b"enca",)
+                    or btype
+                    in (
+                        b"mp4a",
+                        b"ac-3",
+                        b"ec-3",
+                        b"ac-4",
+                        b"Opus",
+                        b"fLaC",
+                        b"alac",
+                        b"dtsc",
+                        b"dtse",
+                        b"dtsh",
+                        b"dtsl",
+                        b"mlpa",
+                        b"samr",
+                        b"sawb",
+                        b"sowt",
+                        b"ipcm",
+                    )
+                    else 8
+                )
+            )
             if body + head < body_end:
                 yield from _mp4_boxes(data, body + head, body_end, depth + 1)
         i += size
@@ -509,8 +613,9 @@ def _guess_nal_codec(headers: list[int]) -> str:
     return "h264/hevc"
 
 
-def _nal_chain(buf: bytes, probes: int = 3, headers: list[int] | None = None,
-               max_len: int | None = None) -> bool:
+def _nal_chain(
+    buf: bytes, probes: int = 3, headers: list[int] | None = None, max_len: int | None = None
+) -> bool:
     """True if buf looks like length-prefixed NAL units (AVC/HEVC in mdat).
 
     Appends each NAL header byte it validates to `headers`, if given. Pass
@@ -525,7 +630,7 @@ def _nal_chain(buf: bytes, probes: int = 3, headers: list[int] | None = None,
         if n == 0 or n > 16 << 20 or (max_len is not None and n > max_len):
             return False
         hdr = buf[i + 4]
-        if hdr & 0x80:                       # forbidden_zero_bit must be 0
+        if hdr & 0x80:  # forbidden_zero_bit must be 0
             return False
         avc_type, hevc_type = hdr & 0x1F, (hdr >> 1) & 0x3F
         if not (1 <= avc_type <= 23 or hevc_type <= 47):
@@ -599,6 +704,8 @@ TRUN_SAMPLE_CTS = 0x000800
 
 @dataclass
 class TrafInfo:
+    """The sample table of one track fragment, flattened out of its boxes."""
+
     track_id: int = 0
     sample_count: int = 0
     sizes: list[int] = field(default_factory=list)
@@ -629,9 +736,9 @@ def _scan_trafs(data: bytes) -> list[TrafInfo]:
             flags = struct.unpack_from(">I", data, body)[0] & 0xFFFFFF
             cur.track_id = struct.unpack_from(">I", data, body + 4)[0]
             i = body + 8
-            if flags & 0x000001:            # base_data_offset (64-bit)
+            if flags & 0x000001:  # base_data_offset (64-bit)
                 i += 8
-            if flags & 0x000002:            # sample_description_index
+            if flags & 0x000002:  # sample_description_index
                 i += 4
             if flags & 0x000008 and i + 4 <= body_end:
                 cur.default_duration = struct.unpack_from(">I", data, i)[0]
@@ -702,7 +809,7 @@ def _classify_traf(info: TrafInfo) -> tuple[Kind, str, str, float]:
 
     Returns (kind, codec-guess, reasoning, signed score: >0 video, <0 audio)."""
     sizes = info.sizes or ([info.default_size] * info.sample_count if info.default_size else [])
-    score = 0.0                                  # >0 video, <0 audio
+    score = 0.0  # >0 video, <0 audio
     why: list[str] = []
 
     if info.trun_flags & TRUN_SAMPLE_CTS and any(c for c in info.ctts):
@@ -718,7 +825,8 @@ def _classify_traf(info: TrafInfo) -> tuple[Kind, str, str, float]:
     # Decide this first: a keyframe peak is positive video evidence, and it
     # outranks a duration that merely coincides with a codec frame length.
     sizes_early = info.sizes or (
-        [info.default_size] * info.sample_count if info.default_size else [])
+        [info.default_size] * info.sample_count if info.default_size else []
+    )
     decisive_peak = False
     if len(sizes_early) >= 4:
         mean_early = sum(sizes_early) / len(sizes_early)
@@ -734,8 +842,10 @@ def _classify_traf(info: TrafInfo) -> tuple[Kind, str, str, float]:
             score -= 2.5
             why.append(f"uniform sample duration {d} = a codec frame size")
         elif uniform and d in AUDIO_FRAME_DURATIONS:
-            why.append(f"duration {d} matches a codec frame size, but a keyframe "
-                       "peak is present -- treating the match as coincidence")
+            why.append(
+                f"duration {d} matches a codec frame size, but a keyframe "
+                "peak is present -- treating the match as coincidence"
+            )
         elif uniform:
             score -= 0.5
             why.append(f"uniform sample duration {d}")
@@ -747,7 +857,7 @@ def _classify_traf(info: TrafInfo) -> tuple[Kind, str, str, float]:
         mean = sum(sizes) / len(sizes)
         if mean > 0:
             var = sum((x - mean) ** 2 for x in sizes) / len(sizes)
-            cv = (var ** 0.5) / mean
+            cv = (var**0.5) / mean
             peak = max(sizes) / mean
             why.append(f"size cv {cv:.2f}, max/mean {peak:.1f}")
             # A keyframe is many times the mean of the frames around it. Nothing
@@ -771,12 +881,14 @@ def _classify_traf(info: TrafInfo) -> tuple[Kind, str, str, float]:
                 if audio_frame_timing:
                     score -= 3.0
                 else:
-                    why.append("flat sizes but no audio frame timing -- "
-                               "consistent with all-intra video, not concluded")
+                    why.append(
+                        "flat sizes but no audio frame timing -- "
+                        "consistent with all-intra video, not concluded"
+                    )
             elif cv <= 0.55 and peak <= 1.8 and audio_frame_timing:
-                score -= 2.0                     # VBR audio: uneven but no peak
+                score -= 2.0  # VBR audio: uneven but no peak
             elif cv >= 0.60:
-                score += 0.5                     # uneven with no peak: all-intra
+                score += 0.5  # uneven with no peak: all-intra
             if len(set(sizes)) == 1 and audio_frame_timing:
                 score -= 1.5
                 why.append("constant sample size (CBR frames or PCM)")
@@ -801,7 +913,7 @@ def _mp4_truncated(data: bytes) -> bool:
             size = struct.unpack_from(">Q", data, i + 8)[0]
             hdr = 16
         elif size == 0:
-            return False                     # "to end of file" -- complete
+            return False  # "to end of file" -- complete
         if size < hdr:
             return False
         if i + size > len(data):
@@ -991,9 +1103,7 @@ def _parse_mp4(data: bytes, rep: Report) -> None:
                             f"overrides -- trusting the observed elementary stream"
                         )
             elif len(tracks) == 1 and tracks[0].kind is not Kind.UNKNOWN:
-                rep.evidence.append(
-                    "no mdat syncword (expected: CMAF stores raw access units)"
-                )
+                rep.evidence.append("no mdat syncword (expected: CMAF stores raw access units)")
 
     rep.tracks = tracks
     if saw_moov:
@@ -1004,7 +1114,6 @@ def _parse_mp4(data: bytes, rep: Report) -> None:
         rep.confidence = "low"
     if saw_sidx and not saw_moov and not saw_moof:
         rep.evidence.append("sidx-only: this is an index/segment-index file")
-
 
 
 # --------------------------------------------------------------------------
@@ -1060,18 +1169,21 @@ PIFF_UUIDS = {
 @dataclass
 class Drm:
     """Everything recoverable about protection without holding a key."""
-    scheme: str = ""                                  # cenc | cbc1 | cens | cbcs
+
+    scheme: str = ""  # cenc | cbc1 | cens | cbcs
     systems: list[str] = field(default_factory=list)  # Widevine, PlayReady, ...
     key_ids: list[str] = field(default_factory=list)  # default_KID / ContentEncKeyID
     iv_size: int = 0
-    pattern: str = ""                                 # e.g. "1:9" for cbcs
-    per_sample: bool = False                          # senc/saiz present
+    pattern: str = ""  # e.g. "1:9" for cbcs
+    per_sample: bool = False  # senc/saiz present
     note: str = ""
 
     def __bool__(self) -> bool:
+        """True when any protection was detected at all."""
         return bool(self.scheme or self.systems or self.key_ids or self.per_sample)
 
     def describe(self) -> str:
+        """One line summarising the protection, for the evidence list."""
         bits = []
         if self.scheme:
             detail = CENC_SCHEMES.get(self.scheme)
@@ -1098,12 +1210,13 @@ def _uuid_hex(data: bytes, off: int) -> str:
 
 
 def _pretty_uuid(hexid: str) -> str:
-    return (f"{hexid[:8]}-{hexid[8:12]}-{hexid[12:16]}-{hexid[16:20]}-{hexid[20:]}")
+    return f"{hexid[:8]}-{hexid[8:12]}-{hexid[12:16]}-{hexid[16:20]}-{hexid[20:]}"
 
 
 # --------------------------------------------------------------------------
 # HLS packed audio (bare elementary streams)
 # --------------------------------------------------------------------------
+
 
 def _id3_len(data: bytes) -> int:
     """Total size of an ID3v2 tag at offset 0, including the 10-byte header."""
@@ -1125,26 +1238,30 @@ def _parse_packed_audio(data: bytes, rep: Report, id3: int) -> bool:
     if _adts_chain(body):
         rep.container = "adts"
         prof = ((body[2] >> 6) & 0x03) + 1
-        rep.tracks = [Track(kind=Kind.AUDIO, codec=f"aac-adts(profile {prof})",
-                            declared=True, observed=True)]
+        rep.tracks = [
+            Track(kind=Kind.AUDIO, codec=f"aac-adts(profile {prof})", declared=True, observed=True)
+        ]
         rep.evidence.append("ADTS syncword chain validated across 3 frames")
         rep.confidence = "high"
         return True
     if body[:2] == b"\x0b\x77":
         rep.container = "ac3"
         bsid = body[5] >> 3 if len(body) > 5 else 8
-        rep.tracks = [Track(kind=Kind.AUDIO, codec="eac3" if bsid > 10 else "ac3",
-                            declared=True, observed=True)]
+        rep.tracks = [
+            Track(
+                kind=Kind.AUDIO, codec="eac3" if bsid > 10 else "ac3", declared=True, observed=True
+            )
+        ]
         rep.evidence.append(f"AC-3 syncword 0x0B77, bsid {bsid}")
         rep.confidence = "high"
         return True
     chain = _mpeg_audio_chain(body, 0)
     if chain:
         rep.container = "mpeg-audio"
-        rep.tracks = [Track(kind=Kind.AUDIO, codec=chain[1],
-                            declared=True, observed=True)]
+        rep.tracks = [Track(kind=Kind.AUDIO, codec=chain[1], declared=True, observed=True)]
         rep.evidence.append(
-            f"MPEG audio frame chain validated across {chain[0]} frames: {chain[1]}")
+            f"MPEG audio frame chain validated across {chain[0]} frames: {chain[1]}"
+        )
         rep.confidence = "high"
         return True
     if body[:4] == b"fLaC":
@@ -1164,18 +1281,31 @@ def _parse_packed_audio(data: bytes, rep: Report, id3: int) -> bool:
         if hit:
             offset, kind, codec = hit
             rep.container = "packed-audio"
-            rep.tracks = [Track(kind=kind, codec=codec, declared=True, observed=True,
-                                note=f"first frame {offset} bytes after the ID3 tag")]
+            rep.tracks = [
+                Track(
+                    kind=kind,
+                    codec=codec,
+                    declared=True,
+                    observed=True,
+                    note=f"first frame {offset} bytes after the ID3 tag",
+                )
+            ]
             rep.evidence.append(f"validated {codec} after resync past the ID3 tag")
             rep.confidence = "high"
             return True
         rep.container = "packed-audio"
-        rep.tracks = [Track(kind=Kind.AUDIO, codec="unknown", declared=True, observed=True,
-                            note="ID3-prefixed but no frame chain validated")]
+        rep.tracks = [
+            Track(
+                kind=Kind.AUDIO,
+                codec="unknown",
+                declared=True,
+                observed=True,
+                note="ID3-prefixed but no frame chain validated",
+            )
+        ]
         rep.confidence = "low"
         return True
     return False
-
 
 
 # --------------------------------------------------------------------------
@@ -1209,11 +1339,11 @@ def _mpeg_audio_frame(hdr: bytes) -> tuple[int, str] | None:
     """Length and description of the MPEG audio frame starting at hdr[0:4]."""
     if len(hdr) < 4 or hdr[0] != 0xFF or (hdr[1] & 0xE0) != 0xE0:
         return None
-    ver = (hdr[1] >> 3) & 0x03            # 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5
+    ver = (hdr[1] >> 3) & 0x03  # 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5
     layer_bits = (hdr[1] >> 1) & 0x03
-    if ver == 1 or layer_bits == 0:       # reserved
+    if ver == 1 or layer_bits == 0:  # reserved
         return None
-    layer = 4 - layer_bits                # 1, 2 or 3
+    layer = 4 - layer_bits  # 1, 2 or 3
     br_idx = (hdr[2] >> 4) & 0x0F
     sr_idx = (hdr[2] >> 2) & 0x03
     if br_idx in (0, 15) or sr_idx == 3:
@@ -1253,9 +1383,9 @@ def _mpeg_audio_chain(buf: bytes, off: int = 0, probes: int = 4) -> tuple[int, s
 def _adts_frame_len(buf: bytes, i: int) -> int | None:
     if i + 7 > len(buf) or buf[i] != 0xFF or (buf[i + 1] & 0xF0) != 0xF0:
         return None
-    if buf[i + 1] & 0x06:                 # layer must be 00 for ADTS
+    if buf[i + 1] & 0x06:  # layer must be 00 for ADTS
         return None
-    if (buf[i + 2] >> 2) & 0x0F > 12:     # sampling_frequency_index 13-15 invalid
+    if (buf[i + 2] >> 2) & 0x0F > 12:  # sampling_frequency_index 13-15 invalid
         return None
     n = ((buf[i + 3] & 0x03) << 11) | (buf[i + 4] << 3) | (buf[i + 5] >> 5)
     return n if 7 <= n <= 8192 else None
@@ -1264,8 +1394,11 @@ def _adts_frame_len(buf: bytes, i: int) -> int | None:
 def _adts_key(buf: bytes, i: int) -> tuple:
     """Stream identity: profile, sample rate index, channel config. Constant for
     the life of a real stream, and the property random data cannot fake."""
-    return (buf[i + 2] >> 6, (buf[i + 2] >> 2) & 0x0F,
-            ((buf[i + 2] & 0x01) << 2) | (buf[i + 3] >> 6))
+    return (
+        buf[i + 2] >> 6,
+        (buf[i + 2] >> 2) & 0x0F,
+        ((buf[i + 2] & 0x01) << 2) | (buf[i + 3] >> 6),
+    )
 
 
 def _mpeg_key(buf: bytes, i: int) -> tuple:
@@ -1273,8 +1406,9 @@ def _mpeg_key(buf: bytes, i: int) -> tuple:
     return ((buf[i + 1] >> 3) & 0x03, (buf[i + 1] >> 1) & 0x03, (buf[i + 2] >> 2) & 0x03)
 
 
-def _frame_coverage(data: bytes, frame_fn, key_fn=None, sync: bytes = b"\xff",
-                    limit: int = 65536) -> tuple[float, int, int]:
+def _frame_coverage(
+    data: bytes, frame_fn, key_fn=None, sync: bytes = b"\xff", limit: int = 65536
+) -> tuple[float, int, int]:
     """Fraction of `data` covered by validated frames, resyncing across gaps.
 
     Demanding N consecutive frames from a fixed offset is brittle against three
@@ -1300,7 +1434,7 @@ def _frame_coverage(data: bytes, frame_fn, key_fn=None, sync: bytes = b"\xff",
     Returns (coverage, frame_count, first_frame_offset) for the best identity.
     """
     n = min(len(data), limit)
-    by_key: dict[tuple, list] = {}          # key -> [covered, frames, first]
+    by_key: dict[tuple, list] = {}  # key -> [covered, frames, first]
     i, guard = 0, 0
     while i < n and guard < 8192:
         guard += 1
@@ -1348,16 +1482,44 @@ def _mpeg_frame_len(buf: bytes, i: int) -> int | None:
 # fscod (48 kHz, 44.1 kHz, 32 kHz). E-AC-3 instead carries an explicit frmsiz
 # field, so the two are computed differently.
 _AC3_SIZES = (
-    (64, 69, 96), (64, 70, 96), (80, 87, 120), (80, 88, 120), (96, 104, 144),
-    (96, 105, 144), (112, 121, 168), (112, 122, 168), (128, 139, 192),
-    (128, 140, 192), (160, 174, 240), (160, 175, 240), (192, 208, 288),
-    (192, 209, 288), (224, 243, 336), (224, 244, 336), (256, 278, 384),
-    (256, 279, 384), (320, 348, 480), (320, 349, 480), (384, 417, 576),
-    (384, 418, 576), (448, 487, 672), (448, 488, 672), (512, 557, 768),
-    (512, 558, 768), (640, 696, 960), (640, 697, 960), (768, 835, 1152),
-    (768, 836, 1152), (896, 975, 1344), (896, 976, 1344), (1024, 1114, 1536),
-    (1024, 1115, 1536), (1152, 1253, 1728), (1152, 1254, 1728),
-    (1280, 1393, 1920), (1280, 1394, 1920),
+    (64, 69, 96),
+    (64, 70, 96),
+    (80, 87, 120),
+    (80, 88, 120),
+    (96, 104, 144),
+    (96, 105, 144),
+    (112, 121, 168),
+    (112, 122, 168),
+    (128, 139, 192),
+    (128, 140, 192),
+    (160, 174, 240),
+    (160, 175, 240),
+    (192, 208, 288),
+    (192, 209, 288),
+    (224, 243, 336),
+    (224, 244, 336),
+    (256, 278, 384),
+    (256, 279, 384),
+    (320, 348, 480),
+    (320, 349, 480),
+    (384, 417, 576),
+    (384, 418, 576),
+    (448, 487, 672),
+    (448, 488, 672),
+    (512, 557, 768),
+    (512, 558, 768),
+    (640, 696, 960),
+    (640, 697, 960),
+    (768, 835, 1152),
+    (768, 836, 1152),
+    (896, 975, 1344),
+    (896, 976, 1344),
+    (1024, 1114, 1536),
+    (1024, 1115, 1536),
+    (1152, 1253, 1728),
+    (1152, 1254, 1728),
+    (1280, 1393, 1920),
+    (1280, 1394, 1920),
 )
 
 
@@ -1368,19 +1530,19 @@ def _ac3_frame_len(buf: bytes, i: int) -> int | None:
     if i + 6 > len(buf) or buf[i] != 0x0B or buf[i + 1] != 0x77:
         return None
     bsid = buf[i + 5] >> 3
-    if bsid <= 10:                                  # AC-3
+    if bsid <= 10:  # AC-3
         fscod, frmsizecod = buf[i + 4] >> 6, buf[i + 4] & 0x3F
         if fscod > 2 or frmsizecod > 37:
             return None
         return _AC3_SIZES[frmsizecod][fscod] * 2
-    if bsid <= 16:                                  # E-AC-3
+    if bsid <= 16:  # E-AC-3
         frmsiz = ((buf[i + 2] & 0x07) << 8) | buf[i + 3]
         return (frmsiz + 1) * 2
     return None
 
 
 def _ac3_key(buf: bytes, i: int) -> tuple:
-    return (buf[i + 5] >> 3, buf[i + 4] >> 6)       # bsid, fscod
+    return (buf[i + 5] >> 3, buf[i + 4] >> 6)  # bsid, fscod
 
 
 def _resync(data: bytes, scan: int = 16384) -> tuple[int, Kind, str] | None:
@@ -1392,9 +1554,10 @@ def _resync(data: bytes, scan: int = 16384) -> tuple[int, Kind, str] | None:
     # Coverage first: it survives interleaved metadata and corrupt frames,
     # which a consecutive-run check does not.
     for frame_fn, key_fn, sync, codec in (
-            (_adts_frame_len, _adts_key, b"\xff", "aac-adts"),
-            (_mpeg_frame_len, _mpeg_key, b"\xff", "mpeg-audio"),
-            (_ac3_frame_len, _ac3_key, b"\x0b", "ac3/eac3")):
+        (_adts_frame_len, _adts_key, b"\xff", "aac-adts"),
+        (_mpeg_frame_len, _mpeg_key, b"\xff", "mpeg-audio"),
+        (_ac3_frame_len, _ac3_key, b"\x0b", "ac3/eac3"),
+    ):
         cover, frames, first = _frame_coverage(data, frame_fn, key_fn, sync)
         # Threshold sits in the measured gap: elementary-stream audio that
         # reaches this path covers 97-100%, while the worst non-audio case in
@@ -1458,8 +1621,15 @@ def _vtt_sample_chain(buf: bytes) -> bool:
     return ok >= 1
 
 
-WEBM_TRACK_TYPES = {1: Kind.VIDEO, 2: Kind.AUDIO, 3: Kind.VIDEO, 0x10: Kind.TEXT,
-                    0x11: Kind.TEXT, 0x12: Kind.DATA, 0x20: Kind.DATA}
+WEBM_TRACK_TYPES = {
+    1: Kind.VIDEO,
+    2: Kind.AUDIO,
+    3: Kind.VIDEO,
+    0x10: Kind.TEXT,
+    0x11: Kind.TEXT,
+    0x12: Kind.DATA,
+    0x20: Kind.DATA,
+}
 
 
 def _ebml_num(data: bytes, i: int, keep_marker: bool) -> tuple[int, int]:
@@ -1486,7 +1656,6 @@ def _parse_webm(data: bytes, rep: Report) -> None:
     # Segment, Tracks, TrackEntry, then the ContentEncodings subtree that
     # carries WebM's equivalent of a sinf box.
     masters = {0x18538067, 0x1654AE6B, 0xAE, 0x6D80, 0x6240, 0x5035, 0x47E7}
-    stack: list[tuple[int, int]] = [(0, len(data))]
     entry: Track | None = None
     i = 0
     guard = 0
@@ -1506,24 +1675,30 @@ def _parse_webm(data: bytes, rep: Report) -> None:
             i = body
             continue
         if entry is not None and body + size <= len(data):
-            if eid == 0x83 and size:                     # TrackType
+            if eid == 0x83 and size:  # TrackType
                 entry.kind = WEBM_TRACK_TYPES.get(data[body], Kind.UNKNOWN)
-            elif eid == 0xD7 and size:                   # TrackNumber
+            elif eid == 0xD7 and size:  # TrackNumber
                 entry.track_id = int.from_bytes(data[body : body + size], "big")
-            elif eid == 0x86:                            # CodecID
+            elif eid == 0x86:  # CodecID
                 entry.codec = data[body : body + size].decode("latin-1", "replace").strip("\x00")
-            elif eid == 0x47E1 and size:                 # ContentEncAlgo
-                algo = {0: "unencrypted", 1: "DES", 2: "3DES", 3: "Twofish",
-                        4: "Blowfish", 5: "AES"}.get(data[body], f"algo {data[body]}")
+            elif eid == 0x47E1 and size:  # ContentEncAlgo
+                algo = {
+                    0: "unencrypted",
+                    1: "DES",
+                    2: "3DES",
+                    3: "Twofish",
+                    4: "Blowfish",
+                    5: "AES",
+                }.get(data[body], f"algo {data[body]}")
                 rep.drm.scheme = rep.drm.scheme or f"WebM ContentEncryption / {algo}"
                 entry.note = (entry.note + f" encrypted ({algo})").strip()
-            elif eid == 0x47E2 and size:                 # ContentEncKeyID
+            elif eid == 0x47E2 and size:  # ContentEncKeyID
                 kid = data[body : body + size].hex()
                 if kid and kid not in rep.drm.key_ids:
                     rep.drm.key_ids.append(kid)
-            elif eid == 0x47E8 and size:                 # AESSettingsCipherMode
+            elif eid == 0x47E8 and size:  # AESSettingsCipherMode
                 rep.drm.note = {1: "AES-CTR", 2: "AES-CBC"}.get(data[body], "")
-        if eid == 0x1F43B675:                            # Cluster -- media payload
+        if eid == 0x1F43B675:  # Cluster -- media payload
             for t in tracks:
                 t.observed = True
             break
@@ -1538,18 +1713,39 @@ def _parse_webm(data: bytes, rep: Report) -> None:
         rep.evidence.append("protection: " + rep.drm.describe())
 
 
-
 # --------------------------------------------------------------------------
 # FLV (RTMP ingest / recording)
 # --------------------------------------------------------------------------
 
-FLV_TAG_KINDS = {8: (Kind.AUDIO, "flv-audio"), 9: (Kind.VIDEO, "flv-video"),
-                 18: (Kind.DATA, "flv-script")}
-FLV_AUDIO_CODECS = {0: "pcm", 1: "adpcm", 2: "mp3", 4: "nellymoser16", 5: "nellymoser8",
-                    6: "nellymoser", 7: "g711a", 8: "g711u", 10: "aac", 11: "speex",
-                    14: "mp3-8k", 15: "device-specific"}
-FLV_VIDEO_CODECS = {2: "h263", 3: "screen", 4: "vp6", 5: "vp6-alpha", 6: "screen2",
-                    7: "h264", 12: "hevc", 13: "av1"}
+FLV_TAG_KINDS = {
+    8: (Kind.AUDIO, "flv-audio"),
+    9: (Kind.VIDEO, "flv-video"),
+    18: (Kind.DATA, "flv-script"),
+}
+FLV_AUDIO_CODECS = {
+    0: "pcm",
+    1: "adpcm",
+    2: "mp3",
+    4: "nellymoser16",
+    5: "nellymoser8",
+    6: "nellymoser",
+    7: "g711a",
+    8: "g711u",
+    10: "aac",
+    11: "speex",
+    14: "mp3-8k",
+    15: "device-specific",
+}
+FLV_VIDEO_CODECS = {
+    2: "h263",
+    3: "screen",
+    4: "vp6",
+    5: "vp6-alpha",
+    6: "screen2",
+    7: "h264",
+    12: "hevc",
+    13: "av1",
+}
 
 
 def _parse_flv(data: bytes, rep: Report) -> None:
@@ -1562,7 +1758,9 @@ def _parse_flv(data: bytes, rep: Report) -> None:
     rep.evidence.append(
         f"FLV header flags 0x{flags:02x}: declares"
         f"{' video' if declared[Kind.VIDEO] else ''}"
-        f"{' audio' if declared[Kind.AUDIO] else ''}" or "nothing")
+        f"{' audio' if declared[Kind.AUDIO] else ''}"
+        or "nothing"
+    )
 
     tracks: dict[Kind, Track] = {}
     for kind, present in declared.items():
@@ -1570,7 +1768,7 @@ def _parse_flv(data: bytes, rep: Report) -> None:
             tracks[kind] = Track(kind=kind, declared=True)
 
     offset = struct.unpack_from(">I", data, 5)[0] if len(data) >= 9 else 9
-    i = max(offset, 9) + 4                     # skip PreviousTagSize0
+    i = max(offset, 9) + 4  # skip PreviousTagSize0
     seen = 0
     while i + 11 <= len(data) and seen < 400:
         tag = data[i] & 0x1F
@@ -1591,7 +1789,7 @@ def _parse_flv(data: bytes, rep: Report) -> None:
                     t.codec = codec
         if size == 0 or size > len(data):
             break
-        i = payload + size + 4                 # payload + PreviousTagSize
+        i = payload + size + 4  # payload + PreviousTagSize
         seen += 1
 
     for kind, t in tracks.items():
@@ -1608,6 +1806,7 @@ def _parse_flv(data: bytes, rep: Report) -> None:
 # --------------------------------------------------------------------------
 # Headless payloads: LL-HLS partial segments and raw elementary streams
 # --------------------------------------------------------------------------
+
 
 def _parse_headless(data: bytes, rep: Report) -> bool:
     """Classify a fragment that begins with media data and no container header.
@@ -1634,10 +1833,15 @@ def _parse_headless(data: bytes, rep: Report) -> bool:
         if len(headers) >= 3:
             codec = _guess_nal_codec(headers)
             rep.container = "annex-b elementary stream"
-            rep.tracks = [Track(kind=Kind.VIDEO, codec=codec, observed=True,
-                                note=f"{len(headers)} NAL units scanned")]
-            rep.evidence.append(
-                f"{len(headers)} Annex-B start codes with valid NAL headers")
+            rep.tracks = [
+                Track(
+                    kind=Kind.VIDEO,
+                    codec=codec,
+                    observed=True,
+                    note=f"{len(headers)} NAL units scanned",
+                )
+            ]
+            rep.evidence.append(f"{len(headers)} Annex-B start codes with valid NAL headers")
             rep.confidence = "high" if codec != "h264/hevc" else "medium"
             return True
 
@@ -1649,29 +1853,46 @@ def _parse_headless(data: bytes, rep: Report) -> bool:
     if hit:
         offset, kind, codec = hit
         rep.container = "elementary stream (resynced)"
-        rep.tracks = [Track(kind=kind, codec=codec, observed=True,
-                            note=f"frame chain starts at offset {offset}")]
+        rep.tracks = [
+            Track(
+                kind=kind, codec=codec, observed=True, note=f"frame chain starts at offset {offset}"
+            )
+        ]
         rep.evidence.append(
             f"no container header; validated {codec} at offset {offset} -- "
-            "continuous stream joined mid-frame")
+            "continuous stream joined mid-frame"
+        )
         rep.confidence = "high" if offset < 4096 else "medium"
         return True
 
     headers = []
     if _nal_chain(head, probes=12, headers=headers, max_len=len(data)):
         rep.container = "headless media payload"
-        rep.tracks = [Track(kind=Kind.VIDEO, codec=_guess_nal_codec(headers), observed=True,
-                            note="length-prefixed NAL run with no container header")]
+        rep.tracks = [
+            Track(
+                kind=Kind.VIDEO,
+                codec=_guess_nal_codec(headers),
+                observed=True,
+                note="length-prefixed NAL run with no container header",
+            )
+        ]
         rep.evidence.append(
             "length-prefixed NAL chain at offset 0 -- looks like an LL-HLS "
-            "partial segment continuing a previous part's mdat")
+            "partial segment continuing a previous part's mdat"
+        )
         rep.confidence = "medium"
         return True
 
     if _adts_chain(head):
         rep.container = "headless media payload"
-        rep.tracks = [Track(kind=Kind.AUDIO, codec="aac-adts", observed=True,
-                            note="ADTS frame run with no container header")]
+        rep.tracks = [
+            Track(
+                kind=Kind.AUDIO,
+                codec="aac-adts",
+                observed=True,
+                note="ADTS frame run with no container header",
+            )
+        ]
         rep.evidence.append("ADTS frame chain at offset 0, no container header")
         rep.confidence = "medium"
         return True
@@ -1683,10 +1904,10 @@ def _parse_headless(data: bytes, rep: Report) -> bool:
 # Top-level dispatch
 # --------------------------------------------------------------------------
 
+
 def _entropy(buf: bytes) -> float:
     if not buf:
         return 0.0
-    import math
     counts = [0] * 256
     for b in buf:
         counts[b] += 1
@@ -1709,6 +1930,7 @@ def sniff(data: bytes) -> Report:
     if data[:3] == b"\x1f\x8b\x08":
         try:
             import gzip
+
             inner = gzip.decompress(data)
         except (OSError, EOFError, zlib.error):
             # A truncated gzip stream still decompresses up to the cut point.
@@ -1723,8 +1945,6 @@ def sniff(data: bytes) -> Report:
         rep.container = "gzip"
         rep.verdict = "gzip stream that could not be decompressed"
         return rep
-
-    head = data[:16]
 
     if data[:7] == b"#EXTM3U" or data.lstrip()[:7] == b"#EXTM3U":
         rep.container, rep.is_playlist, rep.confidence = "m3u8-playlist", True, "high"
@@ -1753,7 +1973,7 @@ def sniff(data: bytes) -> Report:
         _parse_webm(data, rep)
         return _verdict(rep)
 
-    if data[:6] == b"WEBVTT" or (_id3_len(data) and data[_id3_len(data):][:6] == b"WEBVTT"):
+    if data[:6] == b"WEBVTT" or (_id3_len(data) and data[_id3_len(data) :][:6] == b"WEBVTT"):
         rep.container, rep.confidence = "webvtt", "high"
         rep.tracks = [Track(kind=Kind.TEXT, codec="webvtt", declared=True, observed=True)]
         rep.evidence.append("WEBVTT signature")
@@ -1788,11 +2008,14 @@ def sniff(data: bytes) -> Report:
         rep.container, rep.encrypted, rep.confidence = "opaque", "aes-128-full", "low"
         rep.drm.scheme = "aes-128-full (inferred)"
         rep.drm.note = "inferred from entropy alone; confirm with EXT-X-KEY"
-        rep.verdict = ("opaque high-entropy bytes -- most likely AES-128 "
-                       "whole-segment encryption; no structure to classify")
+        rep.verdict = (
+            "opaque high-entropy bytes -- most likely AES-128 "
+            "whole-segment encryption; no structure to classify"
+        )
         rep.evidence.append(
             f"entropy {ent:.2f} bits/byte, length {len(data)} is a multiple of 16, "
-            "and no container or frame chain was found")
+            "and no container or frame chain was found"
+        )
         return rep
 
     # A dead or geofenced stream URL usually redirects to an HTML error page.
@@ -1851,8 +2074,9 @@ def _verdict(rep: Report) -> Report:
         # the one case where this tool genuinely cannot answer: an unreadable
         # payload whose sample table has no usable tells.
         n = sum(1 for t in rep.tracks if t.kind is Kind.UNKNOWN)
-        rep.verdict = (f"{n} track(s) present, kind undetermined "
-                       "-- fetch the init segment to resolve")
+        rep.verdict = (
+            f"{n} track(s) present, kind undetermined " "-- fetch the init segment to resolve"
+        )
     else:
         rep.verdict = "no identifiable media tracks"
 
@@ -1866,8 +2090,10 @@ def _verdict(rep: Report) -> Report:
         detail = []
         if missing:
             detail.append(
-                f"declares {missing}, not seen in this prefix" if rep.truncated
-                else f"declares {missing} but carries none")
+                f"declares {missing}, not seen in this prefix"
+                if rep.truncated
+                else f"declares {missing} but carries none"
+            )
         if extra:
             detail.append(f"carries undeclared {extra}")
         rep.verdict += "  <- " + "; ".join(detail)
@@ -1877,6 +2103,7 @@ def _verdict(rep: Report) -> Report:
 
 
 def format_report(name: str, rep: Report) -> str:
+    """Render one fragment's Report as the CLI's multi-line block."""
     lines = [
         f"{name}",
         f"  container : {rep.container}"
@@ -1910,15 +2137,45 @@ def format_report(name: str, rep: Report) -> str:
 # drift from the one the project is tagged at.
 _UA = f"mediasniff/{__version__} (+https://github.com/FerventOrange/mediasniff)"
 
-_HLS_MEDIA_KINDS = {"AUDIO": "audio", "SUBTITLES": "subtitles",
-                    "CLOSED-CAPTIONS": "closed captions"}
+_HLS_MEDIA_KINDS = {
+    "AUDIO": "audio",
+    "SUBTITLES": "subtitles",
+    "CLOSED-CAPTIONS": "closed captions",
+}
 
 # Used only to turn a CODECS attribute into a comparable claim. Deliberately
 # not exhaustive -- it needs to answer "video, audio, or both", nothing finer.
-_CODECS_VIDEO = ("avc1", "avc2", "avc3", "avc4", "hvc1", "hev1", "dvh1", "dvhe",
-                 "vp08", "vp09", "vp8", "vp9", "av01", "mp4v", "vvc1", "vvi1")
-_CODECS_AUDIO = ("mp4a", "ac-3", "ec-3", "ac-4", "opus", "flac", "alac", "dts",
-                 "mp3", "mha1", "mhm1")
+_CODECS_VIDEO = (
+    "avc1",
+    "avc2",
+    "avc3",
+    "avc4",
+    "hvc1",
+    "hev1",
+    "dvh1",
+    "dvhe",
+    "vp08",
+    "vp09",
+    "vp8",
+    "vp9",
+    "av01",
+    "mp4v",
+    "vvc1",
+    "vvi1",
+)
+_CODECS_AUDIO = (
+    "mp4a",
+    "ac-3",
+    "ec-3",
+    "ac-4",
+    "opus",
+    "flac",
+    "alac",
+    "dts",
+    "mp3",
+    "mha1",
+    "mhm1",
+)
 
 
 def _claim_from_codecs(codecs: str) -> str:
@@ -1938,17 +2195,20 @@ def _claim_from_codecs(codecs: str) -> str:
 @dataclass
 class Rendition:
     """One selectable stream within a manifest."""
+
     label: str
     url: str
-    declared: str = ""          # what the manifest says it carries
+    declared: str = ""  # what the manifest says it carries
     note: str = ""
 
     def __str__(self) -> str:
+        """The rendition's display label."""
         return self.label
 
 
-def _http_get(url: str, nbytes: int | None = None, timeout: float = 15.0,
-              insecure: bool = False) -> tuple[bytes, str]:
+def _http_get(
+    url: str, nbytes: int | None = None, timeout: float = 15.0, insecure: bool = False
+) -> tuple[bytes, str]:
     """GET a URL, optionally only its first `nbytes`. Returns (body, final_url).
 
     Handles the two things that otherwise produce mystery failures: origins that
@@ -1962,6 +2222,7 @@ def _http_get(url: str, nbytes: int | None = None, timeout: float = 15.0,
     ctx = None
     if insecure:
         import ssl
+
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -1977,6 +2238,7 @@ def _http_get(url: str, nbytes: int | None = None, timeout: float = 15.0,
 
 def _attr(line: str, name: str) -> str:
     import re as _re
+
     hit = _re.search(name + r'="([^"]*)"', line) or _re.search(name + r"=([^,\s]+)", line)
     return hit.group(1) if hit else ""
 
@@ -1993,7 +2255,8 @@ def hls_master_renditions(text: str, base: str) -> list[Rendition]:
     out: list[Rendition] = []
     lines = text.splitlines()
     external_audio_groups = {
-        _attr(ln, "GROUP-ID") for ln in lines
+        _attr(ln, "GROUP-ID")
+        for ln in lines
         if ln.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in ln and _attr(ln, "URI")
     }
     for i, line in enumerate(lines):
@@ -2007,15 +2270,26 @@ def hls_master_renditions(text: str, base: str) -> list[Rendition]:
             lang = _attr(line, "LANGUAGE")
             label = f"{kind}: {name}" + (f" ({lang})" if lang and lang != name else "")
             channels = _attr(line, "CHANNELS")
-            out.append(Rendition(label, urllib.parse.urljoin(base, uri), kind,
-                                 f"{channels}ch" if channels else ""))
+            out.append(
+                Rendition(
+                    label,
+                    urllib.parse.urljoin(base, uri),
+                    kind,
+                    f"{channels}ch" if channels else "",
+                )
+            )
         elif line.startswith("#EXT-X-I-FRAME-STREAM-INF"):
             uri = _attr(line, "URI")
             if uri:
                 res = _attr(line, "RESOLUTION")
-                out.append(Rendition(f"trickplay {res}".strip(),
-                                     urllib.parse.urljoin(base, uri),
-                                     "video", "I-frame only"))
+                out.append(
+                    Rendition(
+                        f"trickplay {res}".strip(),
+                        urllib.parse.urljoin(base, uri),
+                        "video",
+                        "I-frame only",
+                    )
+                )
         elif line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
             nxt = lines[i + 1].strip()
             if not nxt or nxt.startswith("#"):
@@ -2027,8 +2301,11 @@ def hls_master_renditions(text: str, base: str) -> list[Rendition]:
             # lives inside this variant, so AUDIO= alone does not move it out.
             if claim == "muxed" and _attr(line, "AUDIO") in external_audio_groups:
                 claim = "video"
-            out.append(Rendition(f"variant {res or 'audio-only'}",
-                                 urllib.parse.urljoin(base, nxt), claim, codecs))
+            out.append(
+                Rendition(
+                    f"variant {res or 'audio-only'}", urllib.parse.urljoin(base, nxt), claim, codecs
+                )
+            )
     return out
 
 
@@ -2115,7 +2392,10 @@ def mpd_renditions(text: str, base: str, prefer_media: bool = False) -> list[Ren
                     if seg is not None:
                         first_t = seg.get("t") or "0"
 
-                def _sub(match):
+                # Bound as defaults rather than closed over: the closure is
+                # redefined each iteration, and capturing the loop variables by
+                # reference is a bug waiting for someone to defer the re.sub.
+                def _sub(match, start=start, first_t=first_t):
                     var, fmt = match.group(1), match.group(2)
                     val = start if var == "Number" else first_t
                     # Keep the zero-pad flag: $Number%04d$ must render "0001",
@@ -2130,8 +2410,7 @@ def mpd_renditions(text: str, base: str, prefer_media: bool = False) -> list[Ren
             if "$" in url:
                 continue
             label = f"{ctype or 'stream'}" + (f" ({lang})" if lang else "")
-            claim = {"video": "video", "audio": "audio",
-                     "text": "subtitles"}.get(ctype, "")
+            claim = {"video": "video", "audio": "audio", "text": "subtitles"}.get(ctype, "")
             if not claim:
                 # DASH carries subtitle tracks as application/mp4; the codec is
                 # what distinguishes them from any other application payload.
@@ -2144,9 +2423,15 @@ def mpd_renditions(text: str, base: str, prefer_media: bool = False) -> list[Ren
     return out
 
 
-def probe_url(url: str, *, nbytes: int = 65536, timeout: float = 15.0,
-              prefer_media: bool = False, insecure: bool = False,
-              limit: int | None = None) -> list[tuple[Rendition, Report | None, str]]:
+def probe_url(
+    url: str,
+    *,
+    nbytes: int = 65536,
+    timeout: float = 15.0,
+    prefer_media: bool = False,
+    insecure: bool = False,
+    limit: int | None = None,
+) -> list[tuple[Rendition, Report | None, str]]:
     """Classify every rendition reachable from a stream URL.
 
     Returns a list of (rendition, report, error). `report` is None when that
@@ -2184,7 +2469,8 @@ def probe_url(url: str, *, nbytes: int = 65536, timeout: float = 15.0,
             child = sniff(blob)
             if child.is_playlist:
                 target, note = hls_media_target(
-                    blob.decode("utf-8", "replace"), where, prefer_media)
+                    blob.decode("utf-8", "replace"), where, prefer_media
+                )
                 if not target:
                     results.append((rend, None, "playlist with no fetchable fragment"))
                     continue
@@ -2193,7 +2479,7 @@ def probe_url(url: str, *, nbytes: int = 65536, timeout: float = 15.0,
                 child = sniff(blob)
             rend.url = where
             results.append((rend, child, ""))
-        except Exception as exc:                            # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             results.append((rend, None, f"{type(exc).__name__}: {exc}"))
     return results
 
@@ -2205,8 +2491,12 @@ def _short_verdict(rep: Report) -> str:
 def _normalized_kind(rep: Report) -> str:
     """Reduce a verdict to the manifest's own vocabulary, for comparison."""
     v = _short_verdict(rep).split("[")[0].strip()
-    for prefix, label in (("muxed", "muxed"), ("video-only", "video"),
-                          ("audio-only", "audio"), ("subtitles", "subtitles")):
+    for prefix, label in (
+        ("muxed", "muxed"),
+        ("video-only", "video"),
+        ("audio-only", "audio"),
+        ("subtitles", "subtitles"),
+    ):
         if v.startswith(prefix):
             return label
     return ""
@@ -2231,11 +2521,9 @@ def format_probe(url: str, results: list[tuple[Rendition, Report | None, str]]) 
             got = _normalized_kind(rep)
             if claimed in ("video", "audio", "muxed", "subtitles") and got and claimed != got:
                 carries += "   <-- manifest said " + claimed
-                mismatches.append((rend, "manifest",
-                                   f"claims {claimed}, bytes carry {got}"))
+                mismatches.append((rend, "manifest", f"claims {claimed}, bytes carry {got}"))
             if "<-" in rep.verdict:
-                mismatches.append((rend, "container",
-                                   rep.verdict.split("<-", 1)[1].strip()))
+                mismatches.append((rend, "container", rep.verdict.split("<-", 1)[1].strip()))
         lines.append(f"  {rend.label.ljust(wl)}  {rend.declared.ljust(wd)}  {carries}")
     if mismatches:
         lines.append("")
@@ -2246,41 +2534,62 @@ def format_probe(url: str, results: list[tuple[Rendition, Report | None, str]]) 
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """Command line entry point. Returns a process exit status."""
     import argparse
-    import sys
 
     ap = argparse.ArgumentParser(
         prog="mediasniff",
         description="Classify media fragments by their content, not their filename.",
         epilog="Give it local fragments, or a stream URL (HLS master, DASH MPD, "
-               "media playlist, or a fragment) to have every rendition resolved "
-               "and classified.")
+        "media playlist, or a fragment) to have every rendition resolved "
+        "and classified.",
+    )
     ap.add_argument("target", nargs="+", help="file path or http(s) URL")
-    ap.add_argument("-n", "--bytes", type=int, default=65536, metavar="N",
-                    help="bytes to read per fragment (default 65536; 4096 is "
-                         "enough for every format here)")
-    ap.add_argument("--media", action="store_true",
-                    help="target media fragments rather than init segments, "
-                         "exercising the harder init-less path")
+    ap.add_argument(
+        "-n",
+        "--bytes",
+        type=int,
+        default=65536,
+        metavar="N",
+        help="bytes to read per fragment (default 65536; 4096 is " "enough for every format here)",
+    )
+    ap.add_argument(
+        "--media",
+        action="store_true",
+        help="target media fragments rather than init segments, "
+        "exercising the harder init-less path",
+    )
     ap.add_argument("--timeout", type=float, default=15.0, metavar="S")
-    ap.add_argument("--limit", type=int, default=None, metavar="N",
-                    help="classify at most N renditions per URL")
-    ap.add_argument("--insecure", action="store_true",
-                    help="skip TLS verification (many stream origins have "
-                         "broken certificates)")
-    ap.add_argument("-v", "--verbose", action="store_true",
-                    help="full per-track detail and evidence for each rendition")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--limit", type=int, default=None, metavar="N", help="classify at most N renditions per URL"
+    )
+    ap.add_argument(
+        "--insecure",
+        action="store_true",
+        help="skip TLS verification (many stream origins have " "broken certificates)",
+    )
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="full per-track detail and evidence for each rendition",
+    )
+    args = ap.parse_args(argv)
 
     failed = False
     for target in args.target:
         if target.startswith(("http://", "https://")):
             try:
-                results = probe_url(target, nbytes=args.bytes, timeout=args.timeout,
-                                    prefer_media=args.media, insecure=args.insecure,
-                                    limit=args.limit)
-            except Exception as exc:                        # noqa: BLE001
+                results = probe_url(
+                    target,
+                    nbytes=args.bytes,
+                    timeout=args.timeout,
+                    prefer_media=args.media,
+                    insecure=args.insecure,
+                    limit=args.limit,
+                )
+            except Exception as exc:  # noqa: BLE001
                 print(f"{target}\n  could not fetch: {type(exc).__name__}: {exc}\n")
                 failed = True
                 continue
@@ -2311,4 +2620,8 @@ if __name__ == "__main__":
         print(format_report(target, sniff(blob)))
         print()
 
-    sys.exit(1 if failed else 0)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

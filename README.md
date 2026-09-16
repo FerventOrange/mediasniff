@@ -436,7 +436,7 @@ field lookup.
 
 ```
 src/mediasniff.py           the classifier
-tests/test_mediasniff.py    117 tests: corpus, short prefixes, fuzz, regressions
+tests/test_mediasniff.py    121 tests: corpus, short prefixes, fuzz, regressions
 tools/fetch_samples.sh      rebuild the corpus from public test vectors
 tools/make_samples.py       derive packed-audio / AES-128 / WebM samples
 tools/evaluate.py           measure separation across many renditions
@@ -446,16 +446,27 @@ tests/fixtures/             checked-in captures from live streams (see its READM
 
 ```bash
 ./tools/fetch_samples.sh    # corpus is gitignored, not committed
-make test
+make hooks                  # install pre-commit (once per clone)
+make check                  # lint + tests, the same checks CI runs
 ```
+
+Formatting and linting are enforced by pre-commit (black, isort, pylint) and
+again in CI, so a push cannot land unformatted. `make format` applies black and
+isort in place; `make lint` only reports.
 
 ### What CI covers, and what it does not
 
-The full suite is 117 tests, but **CI runs 35 of them**. The other 82 need the
+The full suite is 121 tests, but **CI runs 39 of them**. The other 82 need the
 fetchable corpus in `samples/`, which is ~4 MB of third-party stream captures
 and is deliberately not committed -- and having CI re-download it on every push
 would hammer other people's CDNs for no good reason. Those tests skip cleanly
 when the corpus is absent.
+
+Because a suite that skips everything still exits 0, CI asserts that a minimum
+number of tests actually *passed* rather than trusting the exit status -- a
+broken conftest would otherwise go green while testing nothing. Every job must
+succeed for the `all-checks` gate to pass: lint, plus all five Python versions
+(3.10 through 3.14).
 
 What CI does cover is the part most likely to break silently: the inference
 algorithms, and every regression pinned by the committed fixtures in

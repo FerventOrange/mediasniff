@@ -12,6 +12,12 @@ scores the result against the manifest's own declaration.
 Usage:  python3 tools/evaluate.py [--limit N]
 """
 
+# Reaches into the sample-table scorer directly: measuring the margin between
+# audio and video scores is the entire point of this tool, and sniff() only
+# exposes the verdict those scores produce.
+# pylint: disable=missing-function-docstring,redefined-outer-name
+# pylint: disable=wrong-import-position,protected-access
+
 import argparse
 import os
 import re
@@ -24,8 +30,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import mediasniff as ms  # noqa: E402
 
 APPLE = "https://devstreaming-cdn.apple.com/videos/streaming/examples/adv_dv_atmos/main.m3u8"
-UNIFIED = ("https://demo.unified-streaming.com/k8s/features/stable/video/"
-           "tears-of-steel/tears-of-steel.ism/.m3u8")
+UNIFIED = (
+    "https://demo.unified-streaming.com/k8s/features/stable/video/"
+    "tears-of-steel/tears-of-steel.ism/.m3u8"
+)
 
 RANGE_BYTES = 65536
 
@@ -53,17 +61,18 @@ def renditions(master_url):
         name = re.search(r'NAME="([^"]+)"', line)
         if not uri or not typ:
             continue
-        kind = {"AUDIO": "audio", "SUBTITLES": "text",
-                "CLOSED-CAPTIONS": "text"}.get(typ.group(1))
+        kind = {"AUDIO": "audio", "SUBTITLES": "text", "CLOSED-CAPTIONS": "text"}.get(typ.group(1))
         if kind:
-            yield kind, (name.group(1) if name else typ.group(1)), urllib.parse.urljoin(base, uri.group(1))
+            yield kind, (name.group(1) if name else typ.group(1)), urllib.parse.urljoin(
+                base, uri.group(1)
+            )
 
     for i, line in enumerate(lines):
         if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
             nxt = lines[i + 1].strip()
             if nxt and not nxt.startswith("#"):
                 res = re.search(r"RESOLUTION=(\S+?)(?:,|$)", line)
-                tag = (res.group(1) if res else "audio-only variant")
+                tag = res.group(1) if res else "audio-only variant"
                 yield _truth_from_codecs(line), f"variant {tag}", urllib.parse.urljoin(base, nxt)
         elif line.startswith("#EXT-X-I-FRAME-STREAM-INF"):
             uri = re.search(r'URI="([^"]+)"', line)
@@ -72,7 +81,9 @@ def renditions(master_url):
                 # All-intra trickplay: every sample is a keyframe. The hardest
                 # video case there is, because it has none of the usual video
                 # tells -- no B-frames, no non-sync samples.
-                yield "video", f"iframe-only {res.group(1) if res else ''}", urllib.parse.urljoin(base, uri.group(1))
+                yield "video", f"iframe-only {res.group(1) if res else ''}", urllib.parse.urljoin(
+                    base, uri.group(1)
+                )
 
 
 VIDEO_CODEC_RE = re.compile(r"\b(avc[1-4]|hvc1|hev1|dvh[1e]|vp0?[89]|av01|mp4v|vvc1)", re.I)
@@ -128,15 +139,23 @@ def evaluate(master_url, label, limit):
             if not seg_url:
                 continue
             blob = fetch(seg_url, RANGE_BYTES)
-        except Exception as exc:                     # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             print(f"  skip {name}: {exc}")
             continue
         n += 1
 
         rep = ms.sniff(blob)
         if rep.container != "isobmff" or any(t.declared for t in rep.tracks):
-            rows.append((truth, _normalize(rep.verdict), name, rep.container, None,
-                         f"declared ({rep.container})"))
+            rows.append(
+                (
+                    truth,
+                    _normalize(rep.verdict),
+                    name,
+                    rep.container,
+                    None,
+                    f"declared ({rep.container})",
+                )
+            )
             continue
 
         # statistical tier. Note sniff() also has an mdat-syncword fallback that
@@ -151,8 +170,16 @@ def evaluate(master_url, label, limit):
             # against the rendition's own truth.
             row_truth = truth if idx == 0 else "(secondary)"
             got = kind.value if idx else (full if full != "unknown" else kind.value)
-            rows.append((row_truth, got, name, "moof-only", score,
-                         why + ("" if kind.value == got else f" -> {got} via mdat syncword")))
+            rows.append(
+                (
+                    row_truth,
+                    got,
+                    name,
+                    "moof-only",
+                    score,
+                    why + ("" if kind.value == got else f" -> {got} via mdat syncword"),
+                )
+            )
 
     _report(rows)
     return rows
@@ -185,27 +212,37 @@ def _report(rows):
     if stat:
         vid = [r[4] for r in stat if r[0] == "video"]
         aud = [r[4] for r in stat if r[0] == "audio"]
-        print(f"  statistical tier: {len(stat)} fragments "
-              f"(video n={len(vid)}, audio n={len(aud)})")
+        print(
+            f"  statistical tier: {len(stat)} fragments "
+            f"(video n={len(vid)}, audio n={len(aud)})"
+        )
         # Separate the fragments the sample table decided on its own from the
         # ones that only came out right because the mdat payload rescued them.
         vid_clear = [v for v in vid if v >= 2.0]
         aud_clear = [a for a in aud if a <= -2.0]
         if vid:
-            print(f"    video scores : {sorted(set(round(v, 1) for v in vid))}"
-                  f"  -- {len(vid_clear)}/{len(vid)} clear the +2.0 threshold")
+            print(
+                f"    video scores : {sorted(set(round(v, 1) for v in vid))}"
+                f"  -- {len(vid_clear)}/{len(vid)} clear the +2.0 threshold"
+            )
         if aud:
-            print(f"    audio scores : {sorted(set(round(a, 1) for a in aud))}"
-                  f"  -- {len(aud_clear)}/{len(aud)} clear the -2.0 threshold")
+            print(
+                f"    audio scores : {sorted(set(round(a, 1) for a in aud))}"
+                f"  -- {len(aud_clear)}/{len(aud)} clear the -2.0 threshold"
+            )
         if vid_clear and aud_clear:
-            print(f"    separation   : worst decisive video {min(vid_clear):+.1f} vs "
-                  f"worst decisive audio {max(aud_clear):+.1f} "
-                  f"-> gap {min(vid_clear) - max(aud_clear):+.1f}")
+            print(
+                f"    separation   : worst decisive video {min(vid_clear):+.1f} vs "
+                f"worst decisive audio {max(aud_clear):+.1f} "
+                f"-> gap {min(vid_clear) - max(aud_clear):+.1f}"
+            )
         undecided = len(vid) - len(vid_clear) + len(aud) - len(aud_clear)
         if undecided:
-            print(f"    {undecided} fragment(s) undecided by sample table alone; "
-                  f"resolved by the mdat payload tier")
-    for t, g, name, container, score, why in rows:
+            print(
+                f"    {undecided} fragment(s) undecided by sample table alone; "
+                f"resolved by the mdat payload tier"
+            )
+    for t, g, name, _container, score, why in rows:
         mark = "ok  " if t == g else ("??  " if g == "unknown" else "WRONG")
         sc = f"{score:+5.1f}" if score is not None else "  -- "
         print(f"    {mark} truth={t:<6} got={g:<8} {sc}  {name[:34]:<34} {why[:60]}")

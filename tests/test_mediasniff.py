@@ -6,6 +6,13 @@ Every expectation below is the source manifest's own CODECS / contentType
 declaration. The manifest is the answer key and is never an input to sniff().
 """
 
+# Tests reach into the module's internals on purpose: the scoring, the frame
+# walkers and the manifest parsers are where the behaviour worth pinning lives,
+# and exercising them only through sniff() would make failures much harder to
+# localise.
+# pylint: disable=protected-access,missing-function-docstring
+# pylint: disable=redefined-outer-name,unused-argument,implicit-str-concat
+
 import os
 import random
 import struct
@@ -23,6 +30,7 @@ def _fixture(name):
     See tests/fixtures/README.md for provenance."""
     with open(os.path.join(FIXTURES, name), "rb") as fh:
         return fh.read()
+
 
 # (file, expected verdict prefix, expected container)
 CASES = [
@@ -159,11 +167,16 @@ def test_coverage_threshold_sits_in_a_real_gap():
     97-100%; the worst non-audio case (Annex-B H.264 misread as MPEG audio)
     scores 40%. If a change erodes either side, this fails before the wild
     sweep has to find it."""
+
     def best(blob):
-        return max(ms._frame_coverage(blob, fn, kf, sy)[0] for fn, kf, sy in (
-            (ms._adts_frame_len, ms._adts_key, b"\xff"),
-            (ms._mpeg_frame_len, ms._mpeg_key, b"\xff"),
-            (ms._ac3_frame_len, ms._ac3_key, b"\x0b")))
+        return max(
+            ms._frame_coverage(blob, fn, kf, sy)[0]
+            for fn, kf, sy in (
+                (ms._adts_frame_len, ms._adts_key, b"\xff"),
+                (ms._mpeg_frame_len, ms._mpeg_key, b"\xff"),
+                (ms._ac3_frame_len, ms._ac3_key, b"\x0b"),
+            )
+        )
 
     for name in ("packed_audio_noid3.aac", "apple_ec3_seg.mp4"):
         assert best(_load(name)) > 0.90, name
@@ -190,8 +203,7 @@ def test_frame_coverage_rejects_random_data():
     fix would just trade one false positive for another."""
     for _ in range(10):
         noise = os.urandom(65536)
-        for fn, kf in ((ms._adts_frame_len, ms._adts_key),
-                       (ms._mpeg_frame_len, ms._mpeg_key)):
+        for fn, kf in ((ms._adts_frame_len, ms._adts_key), (ms._mpeg_frame_len, ms._mpeg_key)):
             cover, _n, _o = ms._frame_coverage(noise, fn, kf)
             # Observed max over 30 trials is ~12%; the detector fires at 55%.
             assert cover < 0.35, f"noise reached {cover:.0%} coverage"
@@ -205,11 +217,12 @@ def test_ac3_needs_frame_validation_not_just_a_syncword():
     obfuscated video stream report as AC-3 audio, so frame sizes are computed
     from the ATSC A/52 table and chained like every other codec."""
     assert ms._ac3_frame_len(bytes.fromhex("0b7700000c1008"), 0) == 384
-    assert ms._ac3_frame_len(bytes.fromhex("0b77000003ff08"), 0) is None   # frmsizecod > 37
+    assert ms._ac3_frame_len(bytes.fromhex("0b77000003ff08"), 0) is None  # frmsizecod > 37
     assert ms._ac3_frame_len(bytes.fromhex("0b76000000000000"), 0) is None  # wrong syncword
     for _ in range(10):
-        cover, _n, _o = ms._frame_coverage(os.urandom(65536), ms._ac3_frame_len,
-                                           ms._ac3_key, b"\x0b")
+        cover, _n, _o = ms._frame_coverage(
+            os.urandom(65536), ms._ac3_frame_len, ms._ac3_key, b"\x0b"
+        )
         assert cover < 0.35
 
 
@@ -239,10 +252,10 @@ def test_audio_coverage_outranks_a_loose_nal_chain():
 def test_mpeg_audio_frame_lengths():
     """Frame length must be computed, not guessed: resync depends on the next
     syncword landing exactly where the length says it will."""
-    assert ms._mpeg_audio_frame(bytes.fromhex("fffb9064"))[0] == 417   # MPEG1 L3 128k/44.1k
-    assert ms._mpeg_audio_frame(bytes.fromhex("fff35064"))[0] == 130   # MPEG2 L3 40k/22.05k
-    assert ms._mpeg_audio_frame(bytes.fromhex("ffe00000")) is None     # reserved version
-    assert ms._mpeg_audio_frame(bytes.fromhex("fffbf064")) is None     # bad bitrate index
+    assert ms._mpeg_audio_frame(bytes.fromhex("fffb9064"))[0] == 417  # MPEG1 L3 128k/44.1k
+    assert ms._mpeg_audio_frame(bytes.fromhex("fff35064"))[0] == 130  # MPEG2 L3 40k/22.05k
+    assert ms._mpeg_audio_frame(bytes.fromhex("ffe00000")) is None  # reserved version
+    assert ms._mpeg_audio_frame(bytes.fromhex("fffbf064")) is None  # bad bitrate index
 
 
 def test_moof_only_audio_has_no_syncword_to_find():
@@ -347,19 +360,20 @@ def test_lone_sync_byte_is_not_mpeg_ts():
     # Deterministic on purpose: random filler can itself contain a plausible
     # packet header and make this test flaky.
     filler = bytes((i * 37 + 11) % 256 for i in range(360))
-    filler = filler.replace(b"\x47", b"\x46")          # exactly one 0x47, placed below
+    filler = filler.replace(b"\x47", b"\x46")  # exactly one 0x47, placed below
     blob = filler[:283] + b"\x47" + filler[284:]
     assert len([b for b in blob if b == 0x47]) == 1
     assert ms._ts_layout(blob) is None
     # header validation, not just the sync byte
-    assert not ms._ts_packet_ok(b"\x47\x80\x00\x10" + b"\x00" * 184, 0)   # error flag
-    assert not ms._ts_packet_ok(b"\x47\x00\x00\x00" + b"\x00" * 184, 0)   # afc == 0
+    assert not ms._ts_packet_ok(b"\x47\x80\x00\x10" + b"\x00" * 184, 0)  # error flag
+    assert not ms._ts_packet_ok(b"\x47\x00\x00\x00" + b"\x00" * 184, 0)  # afc == 0
     assert ms._ts_packet_ok(b"\x47\x40\x00\x10" + b"\x00" * 184, 0)
 
 
 def test_gzipped_fragments_are_unwrapped():
     """Some origins serve playlists gzipped without the client decoding it."""
     import gzip as _gzip
+
     inner = b"#EXTM3U\n#EXT-X-VERSION:3\nindex.m3u8\n"
     rep = ms.sniff(_gzip.compress(inner))
     assert rep.is_playlist
@@ -372,13 +386,14 @@ def test_prefix_does_not_disprove_a_declared_track():
     must not be treated as absent."""
     blob = _load("ts_muxed.ts")
     assert not ms.sniff(blob).truncated
-    prefix = blob[: 188 * 20 + 40]              # deliberately mid-packet
+    prefix = blob[: 188 * 20 + 40]  # deliberately mid-packet
     rep = ms.sniff(prefix)
     assert rep.truncated
     assert rep.verdict.startswith("muxed")
 
 
 # --- regressions found by tools/wild.py against real-world streams ---------
+
 
 def test_real_llhls_part_without_a_keyframe_is_still_video():
     """A 0.2 s LL-HLS part holds ~5 inter frames and no keyframe, so its sample
@@ -532,8 +547,9 @@ def test_hls_master_renditions():
 
 
 def test_hls_media_target_prefers_the_init_segment():
-    playlist = ('#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n'
-                '#EXTINF:4,\nseg1.m4s\n#EXTINF:4,\nseg2.m4s\n')
+    playlist = (
+        "#EXTM3U\n" '#EXT-X-MAP:URI="init.mp4"\n' "#EXTINF:4,\nseg1.m4s\n" "#EXTINF:4,\nseg2.m4s\n"
+    )
     url, note = ms.hls_media_target(playlist, "https://x.test/v/p.m3u8")
     assert url == "https://x.test/v/init.mp4" and note == "init segment"
     url, note = ms.hls_media_target(playlist, "https://x.test/v/p.m3u8", prefer_media=True)
@@ -582,21 +598,26 @@ def test_normalized_kind_matches_manifest_vocabulary():
 # trickplay tracks -- the common real instance -- cannot be sampled from public
 # stream directories. So it is pinned synthetically.
 
+
 def _fragment(duration, sizes, payload):
     """Minimal styp+moof+mdat with a chosen sample table and opaque payload."""
+
     def box(btype, body):
         return struct.pack(">I", len(body) + 8) + btype + body
 
-    tfhd = box(b"tfhd", struct.pack(">I", 0x020000 | 0x08)
-               + struct.pack(">I", 1) + struct.pack(">I", duration))
+    tfhd = box(
+        b"tfhd",
+        struct.pack(">I", 0x020000 | 0x08) + struct.pack(">I", 1) + struct.pack(">I", duration),
+    )
     trun_body = struct.pack(">I", 0x000201) + struct.pack(">I", len(sizes)) + struct.pack(">i", 0)
     for size in sizes:
         trun_body += struct.pack(">I", size)
-    traf = box(b"traf", tfhd + box(b"tfdt", struct.pack(">II", 0, 0))
-               + box(b"trun", trun_body))
-    return (box(b"styp", b"msdh" + b"\x00" * 4 + b"msdh")
-            + box(b"moof", box(b"mfhd", struct.pack(">II", 0, 1)) + traf)
-            + box(b"mdat", payload))
+    traf = box(b"traf", tfhd + box(b"tfdt", struct.pack(">II", 0, 0)) + box(b"trun", trun_body))
+    return (
+        box(b"styp", b"msdh" + b"\x00" * 4 + b"msdh")
+        + box(b"moof", box(b"mfhd", struct.pack(">II", 0, 1)) + traf)
+        + box(b"mdat", payload)
+    )
 
 
 # All-intra CBR: every sample is a keyframe, so there is no size peak, no
@@ -623,16 +644,18 @@ def test_nal_bound_uses_the_declared_mdat_size_not_the_bytes_we_hold():
     Caught by the wild sweep: a live 1080p fMP4 stream went unresolved.
     """
     nals = [(11, 0x06), (40000, 0x65), (900, 0x41)]
-    payload = b"".join(struct.pack(">I", n) + bytes([h]) + b"\x00" * min(n - 1, 600)
-                       for n, h in nals)
+    payload = b"".join(
+        struct.pack(">I", n) + bytes([h]) + b"\x00" * min(n - 1, 600) for n, h in nals
+    )
     # mdat declares 40 KB more than we actually hold -- the truncated-fetch case
     declared = len(payload) + 40000
     mdat = struct.pack(">I", declared + 8) + b"mdat" + payload
     moof_traf = _fragment(3600, [n for n, _ in nals], b"")[:-8]
     blob = moof_traf + mdat
 
-    assert ms._nal_chain(payload, probes=3, max_len=len(payload)) is False, (
-        "bounding by the held bytes should reject the 40 KB NAL -- that is the bug")
+    assert (
+        ms._nal_chain(payload, probes=3, max_len=len(payload)) is False
+    ), "bounding by the held bytes should reject the 40 KB NAL -- that is the bug"
     assert ms._nal_chain(payload, probes=3, max_len=declared)
     assert ms.sniff(blob).verdict.startswith("video-only")
 
@@ -646,16 +669,18 @@ def test_a_keyframe_peak_outranks_a_coincidental_duration_match():
     Caught by the wild sweep: a real 1080p stream at duration 512 with a 12x
     keyframe peak was scored down into 'undetermined'.
     """
-    peaky = [700] * 29 + [9000]          # one keyframe among inter frames
+    peaky = [700] * 29 + [9000]  # one keyframe among inter frames
     kind, _c, why, score = ms._classify_traf(
-        ms._scan_trafs(_fragment(512, peaky, _noise(sum(peaky))))[0])
+        ms._scan_trafs(_fragment(512, peaky, _noise(sum(peaky))))[0]
+    )
     assert kind is ms.Kind.VIDEO, f"{kind.value} at {score:+.1f}: {why}"
     assert "coincidence" in why
 
     # ...but with no peak, the duration match still counts for audio
     flat = [418] * 200
     kind, _c, _why, _s = ms._classify_traf(
-        ms._scan_trafs(_fragment(512, flat, _noise(sum(flat))))[0])
+        ms._scan_trafs(_fragment(512, flat, _noise(sum(flat))))[0]
+    )
     assert kind is ms.Kind.AUDIO
 
 
@@ -709,7 +734,7 @@ def test_all_intra_video_is_not_concluded_to_be_audio():
 
 
 def test_undetermined_is_not_reported_as_no_media():
-    """"A track we cannot type" and "no media here" are different claims."""
+    """ "A track we cannot type" and "no media here" are different claims."""
     blob = _fragment(3600, _ALL_INTRA_CBR, _noise(sum(_ALL_INTRA_CBR)))
     rep = ms.sniff(blob)
     assert rep.tracks, "the track exists even though its kind does not resolve"
@@ -718,9 +743,11 @@ def test_undetermined_is_not_reported_as_no_media():
 
 def test_the_gate_does_not_cost_us_real_audio():
     """Gating on positive audio timing must not weaken genuine audio."""
-    for duration, sizes in ((1024, [418] * 200),      # AAC-LC CBR
-                            (1536, [1792] * 120),     # AC-3
-                            (2048, [300] * 100)):     # HE-AAC
+    for duration, sizes in (
+        (1024, [418] * 200),  # AAC-LC CBR
+        (1536, [1792] * 120),  # AC-3
+        (2048, [300] * 100),
+    ):  # HE-AAC
         blob = _fragment(duration, sizes, _noise(sum(sizes)))
         assert ms.sniff(blob).verdict.startswith("audio-only"), duration
 
@@ -738,5 +765,5 @@ def test_known_limitation_audio_frame_duration_collision():
     assert colliding, "these are the values reachable by video at 24/25/30 fps"
     blob = _fragment(512, _ALL_INTRA_CBR, _noise(sum(_ALL_INTRA_CBR)))
     rep = ms.sniff(blob)
-    assert rep.verdict.startswith("audio-only")        # known-wrong, by design
+    assert rep.verdict.startswith("audio-only")  # known-wrong, by design
     assert rep.confidence != "high", "at least never claim high confidence here"
