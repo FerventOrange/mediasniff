@@ -1,5 +1,7 @@
 # mediasniff
 
+[![tests](https://github.com/FerventOrange/mediasniff/actions/workflows/tests.yml/badge.svg)](https://github.com/FerventOrange/mediasniff/actions/workflows/tests.yml)
+
 Classify streaming media fragments by their **content**, not their filename.
 
 Answers *muxed / video-only / audio-only / subtitles / metadata / encrypted* for
@@ -446,6 +448,21 @@ tests/fixtures/             checked-in captures from live streams (see its READM
 ./tools/fetch_samples.sh    # corpus is gitignored, not committed
 make test
 ```
+
+### What CI covers, and what it does not
+
+The full suite is 117 tests, but **CI runs 35 of them**. The other 82 need the
+fetchable corpus in `samples/`, which is ~4 MB of third-party stream captures
+and is deliberately not committed -- and having CI re-download it on every push
+would hammer other people's CDNs for no good reason. Those tests skip cleanly
+when the corpus is absent.
+
+What CI does cover is the part most likely to break silently: the inference
+algorithms, and every regression pinned by the committed fixtures in
+`tests/fixtures/`. So a green badge means the classifier logic is intact, not
+that the corpus has been re-validated. Run `./tools/fetch_samples.sh && make
+test` locally for the full picture, and `tools/wild.py` for real-world streams
+-- neither of which CI can do for you.
 
 The corpus is deliberately adversarial: four `.dash` files with byte-identical
 magic and brands (two audio, two video), two `.ts` files of identical length
